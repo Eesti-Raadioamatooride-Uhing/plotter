@@ -1,24 +1,40 @@
-# Plotter runs as two containers:
+# Plotter runs as two containers, and the whole stack runs as an ordinary user:
 #   app  - the FastAPI/uvicorn service, reachable ONLY on the internal network
 #   waf  - Apache httpd + ModSecurity v3 + OWASP Core Rule Set, the only thing
-#          published to the host (:8088, which Cloudflare's origin pull hits).
+#          published to the host (:8088 by default, which Cloudflare's origin
+#          pull hits). It listens on 8080 inside, so no privileged port and no
+#          root are needed anywhere.
 # All public traffic is therefore filtered by the WAF before it reaches the app.
+#
+# Settings come from ./.env (copy .env.example, or let deploy/deploy.sh do it).
+# Fixed project name so the stack is the same stack no matter which directory
+# it is brought up from (the CI runner checks out to a new path every time).
+name: plotter
 
 services:
   app:
     build: .
     image: plotter-app:latest
     restart: unless-stopped
-    # Run as the host's plotter user so the bind-mounted state stays writable
-    # and the host-side nightly refresh (same uid) shares it.
-    user: "997:988"
+    # Who the app runs as INSIDE the container. It has to be able to write the
+    # bind-mounted state directory:
+    #   rootful docker  -> your host uid:gid, e.g. 1000:1000
+    #   rootless docker/podman -> 0:0, which is already mapped to your host user
+    # deploy/deploy.sh works this out and writes it to .env.
+    user: "${PLOTTER_RUN_AS:-10001:10001}"
     env_file:
-      - /etc/plotter/plotter.env
-    environment:
-      PLOTTER_HOST: "0.0.0.0"
-      PLOTTER_PORT: "8000"
+      # Optional: the image carries working defaults for everything in it.
+      - path: .env
+        required: false
     volumes:
-      - /var/lib/plotter:/var/lib/plotter
+      # :z relabels for SELinux hosts (Fedora/RHEL) and is a no-op elsewhere.
+      - ${PLOTTER_STATE_DIR:-./data}:/data:z
+      # Your own DEM tiles, read-only. Downloaded Maa-amet 1 m or MML 2 m data
+      # (or a .vrt over them) beats the 30 m Copernicus fallback and needs no
+      # network at all. deploy.sh points this at the state directory when you
+      # have none, because docker creates a missing bind-mount source as root
+      # and this stack is meant to leave nothing root-owned behind.
+      - ${PLOTTER_DEM_DIR:-${PLOTTER_STATE_DIR:-./data}}:/dem:ro,z
     expose:
       - "8000"
 
@@ -28,7 +44,7 @@ services:
     depends_on:
       - app
     environment:
-      SERVERNAME: "plotter.erau.ee"
+      SERVERNAME: "${PLOTTER_SERVERNAME:-plotter.local}"
       BACKEND: "http://app:8000"
       PORT: "8080"
       # Actively block, at CRS paranoia level 1, with a slightly relaxed
@@ -37,8 +53,14 @@ services:
       PARANOIA: "1"
       ANOMALY_INBOUND: "10"
       ANOMALY_OUTBOUND: "6"
-      # Coverage/link computations can take a while behind the proxy.
-      PROXY_TIMEOUT: "180"
+      # Coverage runs are genuinely slow: a cold fine-detail 250 km sweep is
+      # ~360k ITM solves and measured 162 s on a fast box. At 180 s Apache cut
+      # the connection and the browser reported it as a bare NetworkError, so
+      # give it real headroom. The station-pick prefetch keeps normal runs
+      # well under this.
+      PROXY_TIMEOUT: "600"
+      # Apache's global Timeout, which the CRS image sets to 60 by default.
+      TIMEOUT: "600"
       MODSEC_REQ_BODY_LIMIT: "1048576"
     ports:
-      - "8088:8080"
+      - "${PLOTTER_PUBLIC_PORT:-8088}:8080"

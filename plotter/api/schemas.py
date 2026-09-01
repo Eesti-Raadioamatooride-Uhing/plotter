@@ -46,6 +46,11 @@ class LinkRequest(BaseModel):
     climate: int = 6
     polarisation: str = "vertical"
     availability_pct: float = 99.9
+    # ITM time availability and confidence. 0.9 is the conservative "works on
+    # 90 % of days" answer. Over-horizon paths (troposcatter, tropo ducting)
+    # live at the other end of this: ask for 0.1 to see an enhanced day.
+    reliability: float = 0.9
+    confidence: float = 0.5
     high_res_terrain: bool = True
     points: int | None = None
     include_profile: bool = True

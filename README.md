@@ -38,34 +38,45 @@ quietly returning a number.
 
 ## Quick start
 
+`make` on its own lists every target. The common ones appear below.
+
 ### Development
 
 ```bash
-python3 -m venv venv && . venv/bin/activate
-pip install -e .
-uvicorn plotter.main:app --reload --port 8088
+make sync                                # creates .venv from uv.lock
+make serve                               # uvicorn with reload on :8088
 ```
 
 Open <http://127.0.0.1:8088>. Elevation tiles download on first use and cache
-under `./data/cache`.
-
-### Production (Linux, venv + systemd)
-
-```bash
-sudo ./deploy/install.sh
-```
-
-That installs to `/opt/plotter`, creates a `plotter` service user, sets up a
-virtualenv, installs the systemd unit and a nightly data-refresh timer, and
-starts the service on `127.0.0.1:8088`. Put `deploy/nginx.conf` in front of it
-for anything public-facing.
-
-Then warm the caches:
+under `./data/cache`. If you would rather not install `uv`, the container
+gives you the same thing:
 
 ```bash
-sudo -u plotter /opt/plotter/venv/bin/plotter-refresh warm        # ~4 GB of DEM
-sudo -u plotter /opt/plotter/venv/bin/plotter-refresh refresh all # masts + register
+make dev                                 # app only, on 127.0.0.1:8088
 ```
+
+### Production (Docker, no root)
+
+```bash
+make up
+```
+
+Two containers, both run by an ordinary user: the app on an internal network
+only, and Apache with ModSecurity v3 and the OWASP Core Rule Set in front of
+it, published on `:8088`. Nothing needs sudo, nothing is installed on the
+host, and state lives in `~/.local/share/plotter`. Put TLS in front of it
+(Cloudflare, or `deploy/nginx.conf`) for anything public facing.
+
+Then warm the caches and install the nightly refresh timer:
+
+```bash
+make warm                                # ~4 GB of DEM
+make refresh                             # masts + register
+make timer                               # nightly refresh at 03:20
+```
+
+`deploy/DEPLOY.md` has the full flow, including how to migrate off the old
+root install.
 
 ---
 
@@ -172,7 +183,8 @@ plotter/
       ionosphere.py         GIRO ionosonde + NOAA solar indices
   api/                      FastAPI routes and request models
   static/                   the web UI (Leaflet, no build step)
-deploy/                     systemd units, nginx config, installer
+deploy/                     deploy script, user timer, nginx reference
+Makefile                    the commands above, self-documenting
 tests/                      reference-value tests
 ```
 
@@ -214,13 +226,14 @@ See `.env.example`. The ones worth knowing:
 | `PLOTTER_MML_API_KEY` | — | For on-demand Finnish elevation |
 | `PLOTTER_JVIS_MODULE_PATH` | `/modules/side/raadiosagedus/avalik` | Set this if the portal moves |
 | `PLOTTER_JVIS_USER_AGENT` | generic | **Put a real contact address here** |
-| `PLOTTER_MAX_COVERAGE_RANGE_KM` | 400 | Guards against accidental huge runs |
+| `PLOTTER_MAX_COVERAGE_RANGE_KM` | 2000 | ITM's own documented ceiling |
+| `PLOTTER_MAX_COVERAGE_POINTS` | 500000 | ITM solves per sweep; the steps coarsen to fit |
 | `PLOTTER_COVERAGE_WORKERS` | 8 | Threads for the radial sweep |
 
 ## Tests
 
 ```bash
-python -m pytest tests -q
+make check                               # pytest plus pyflakes
 ```
 
 The tests check against published reference values where they exist: free-space

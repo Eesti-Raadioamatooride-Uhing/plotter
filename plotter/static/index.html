@@ -37,7 +37,7 @@
           <div><label>Longitude</label><input id="cov-lon" type="number" step="0.00001" value="24.7536"></div>
         </div>
         <div class="row two">
-          <div><label>Antenna height <span class="u">m AGL</span></label><input id="cov-h" type="number" step="1" value="20"></div>
+          <div><label>TX antenna height <span class="u">m AGL</span></label><input id="cov-h" type="number" step="1" value="20"></div>
           <div><label>Ground <span class="u">m AMSL</span></label><input id="cov-amsl" type="text" readonly placeholder="—"></div>
         </div>
       </div>
@@ -52,13 +52,15 @@
       </div>
       <div class="row two">
         <div><label>Antenna</label><select id="cov-ant"></select></div>
-        <div><label>Gain / bearing</label>
-          <div class="inline"><input id="cov-gain" type="number" step="0.1" value="6" title="Gain, dBi"><input id="cov-bear" type="number" step="1" value="0" title="Boresight bearing, degrees"></div>
-        </div>
+        <div><label>Gain <span class="u">dBi</span></label><input id="cov-gain" type="number" step="0.1" value="8.15" title="Peak gain. Follows the antenna you pick; override it if you know better."></div>
+      </div>
+      <div class="row two" id="cov-bear-row">
+        <div><label>Beam bearing <span class="u">deg true</span></label><input id="cov-bear" type="number" step="1" min="0" max="359" value="0" title="Where the beam points. 0 is true north."></div>
+        <div><label>&nbsp;</label><button class="ghost" id="cov-bear-pick" title="Click a point on the map and the beam is aimed at it">Aim on map</button></div>
       </div>
       <div class="row two">
         <div><label>Receiver</label><select id="cov-mode"></select></div>
-        <div><label>RX height <span class="u">m</span></label><input id="cov-rxh" type="number" step="0.5" value="2"></div>
+        <div><label>RX antenna height <span class="u">m AGL</span></label><input id="cov-rxh" type="number" step="0.5" value="2" title="2 m is a handheld at head height. A roof or mast station is 20 to 40 m, which is worth tens of dB on an over-horizon path."></div>
       </div>
       <div class="row two">
         <div><label>Range <span class="u">km</span></label><input id="cov-range" type="number" step="5" value="60"></div>
@@ -75,10 +77,11 @@
           <div><label>Climate</label><select id="cov-climate"></select></div>
         </div>
         <div class="row two">
-          <div><label>Reliability</label><select id="cov-rel">
-            <option value="0.5">50 % of locations</option>
-            <option value="0.9" selected>90 % of locations</option>
-            <option value="0.95">95 % of locations</option>
+          <div><label>Time availability</label><select id="cov-rel">
+            <option value="0.1">10 % of the time (lift / tropo)</option>
+            <option value="0.5">50 % of the time (average)</option>
+            <option value="0.9" selected>90 % of the time (reliable)</option>
+            <option value="0.95">95 % of the time (conservative)</option>
           </select></div>
           <div><label>Clutter <span class="u">m</span></label><input id="cov-clutter" type="number" step="1" value="0" title="Add trees/buildings on top of the bare terrain"></div>
         </div>
@@ -116,7 +119,7 @@
         </div>
         <div class="row two">
           <div><label>Antenna</label><select id="a-ant"></select></div>
-          <div><label>Gain / size</label><input id="a-gain" type="number" step="0.1" value="28"></div>
+          <div><label>Gain / size</label><input id="a-gain" type="number" step="0.1" value="0.6"></div>
         </div>
       </div>
 
@@ -133,7 +136,7 @@
         </div>
         <div class="row two">
           <div><label>Antenna</label><select id="b-ant"></select></div>
-          <div><label>Gain / size</label><input id="b-gain" type="number" step="0.1" value="28"></div>
+          <div><label>Gain / size</label><input id="b-gain" type="number" step="0.1" value="0.6"></div>
         </div>
       </div>
 
@@ -159,6 +162,15 @@
         <div class="row two">
           <div><label>k factor</label><input id="lnk-k" type="number" step="0.05" value="1.333"></div>
           <div><label>Clutter <span class="u">m</span></label><input id="lnk-clutter" type="number" step="1" value="0"></div>
+        </div>
+        <div class="row two">
+          <div><label>Time availability</label><select id="lnk-rel">
+            <option value="0.1">10 % of the time (lift / tropo)</option>
+            <option value="0.5">50 % of the time (average)</option>
+            <option value="0.9" selected>90 % of the time (reliable)</option>
+            <option value="0.95">95 % of the time (conservative)</option>
+          </select></div>
+          <div><label>Climate</label><select id="lnk-climate"></select></div>
         </div>
         <label class="check"><input type="checkbox" id="lnk-hires" checked> Use high-resolution terrain (slower)</label>
         <label class="check"><input type="checkbox" id="lnk-buildings" checked> Show ETAK building heights (Estonia)</label>
@@ -222,6 +234,13 @@
   </aside>
 
   <main id="map"></main>
+
+  <!-- Live readout of what is under the cursor after a coverage run. -->
+  <div id="readout" class="hidden"></div>
+
+  <!-- Terrain prefetch progress, so a cold area is visibly loading rather
+       than silently stalling the next coverage run. -->
+  <div id="warm-status" class="hidden"></div>
 
   <div id="profile" class="hidden">
     <div class="profile-head">

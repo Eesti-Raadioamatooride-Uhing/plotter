@@ -8,3 +8,6 @@ data/
 *.sqlite
 *.tif
 tests/
+.env
+deploy/
+README.md

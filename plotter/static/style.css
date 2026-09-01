@@ -99,7 +99,7 @@ button.pick, button.ghost {
   cursor: pointer;
 }
 button.pick:hover, button.ghost:hover { border-color: var(--accent); }
-button.pick.armed { border-color: var(--accent-2); color: var(--accent-2); }
+button.pick.armed, button.ghost.armed { border-color: var(--accent-2); color: var(--accent-2); }
 button.ghost { width: 100%; margin-top: 7px; }
 
 button.go {
@@ -120,6 +120,9 @@ details[open].adv summary::before { content: "▾ "; }
 details.adv > div, details.adv > label { margin-top: 8px; }
 
 .hr { height: 1px; background: var(--line); margin: 16px 0 12px; }
+
+/* Secondary reading beside a primary number, e.g. the S meter next to dBm. */
+.dim { color: var(--dim); font-weight: 400; }
 
 /* ------------------------------------------------------------ results */
 .result { margin-top: 14px; font-size: 12.5px; }
@@ -176,7 +179,11 @@ canvas.pattern { width: 100%; height: 200px; display: block; margin-top: 8px; }
 
 .legend { display: flex; gap: 0; margin-top: 10px; border-radius: 4px; overflow: hidden; }
 .legend div { flex: 1; height: 10px; }
-.legend-labels { display: flex; justify-content: space-between; color: var(--dim); font-size: 10px; margin-top: 2px; font-family: var(--mono); }
+.legend div { border-right: 1px solid var(--panel); }
+.legend div:last-child { border-right: none; }
+/* One label under each band rather than only the two ends. */
+.legend-labels { display: flex; color: var(--dim); font-size: 10px; margin-top: 3px; font-family: var(--mono); }
+.legend-labels span { flex: 1; text-align: center; }
 
 /* --------------------------------------------------------------- map */
 #map { flex: 1; background: #10161d; }
@@ -250,6 +257,26 @@ canvas.pattern { width: 100%; height: 200px; display: block; margin-top: 8px; }
    back into layout and letting the canvas grow taller than the panel (which
    pushed the terrain plot out of view). */
 #profile-canvas { flex: 1 1 0; min-height: 0; width: 100%; display: block; }
+
+/* Cursor readout. Sits above the map, clear of the legend and the profile
+   panel, and never eats mouse events. */
+#readout {
+  position: absolute; top: 14px; right: 16px; z-index: 1500;
+  background: var(--panel); border: 1px solid var(--line); color: var(--ink);
+  padding: 6px 11px; border-radius: 6px; font-family: var(--mono);
+  font-size: 12px; letter-spacing: .2px; pointer-events: none;
+  box-shadow: 0 6px 20px rgba(0,0,0,.45);
+}
+#readout.hidden { display: none; }
+
+#warm-status {
+  position: absolute; top: 14px; left: 404px; z-index: 1500;
+  background: var(--panel); border: 1px solid var(--line); color: var(--dim);
+  padding: 6px 11px; border-radius: 6px; font-family: var(--mono);
+  font-size: 12px; pointer-events: none;
+  box-shadow: 0 6px 20px rgba(0,0,0,.45);
+}
+#warm-status.hidden { display: none; }
 
 #toast {
   position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);

@@ -18,6 +18,14 @@ dependencies = [
 plotter = "plotter.main:main"
 plotter-refresh = "plotter.cli:main"
 
+[dependency-groups]
+dev = ["pytest>=8.0", "pyflakes>=3.2"]
+
+[tool.uv]
+# The container and the dev checkout resolve from the same uv.lock, so what
+# passes tests locally is what ships in the image.
+package = true
+
 [tool.setuptools.packages.find]
 include = ["plotter*"]
 

@@ -106,6 +106,7 @@ def evaluate(profile, tx: Endpoint, rx: Endpoint, freq_mhz: float, *,
              polarisation: str = "vertical",
              ground: str = "average",
              target_availability_pct: float = 99.9,
+             reliability: float = 0.9, confidence: float = 0.5,
              include_profile: bool = True,
              use_itm: bool | None = None) -> LinkResult:
     """Run the whole chain over an already-built terrain profile."""
@@ -132,7 +133,7 @@ def evaluate(profile, tx: Endpoint, rx: Endpoint, freq_mhz: float, *,
             radio_climate=climate,
             polarization=(itm.POL_VERTICAL if polarisation.startswith("v")
                           else itm.POL_HORIZONTAL),
-            conf=0.5, rel=0.9)
+            conf=confidence, rel=reliability)
         itm_loss, itm_mode, itm_warn = r.loss_db, r.mode, r.warning_text
         if r.warning >= 3:
             notes.append(f"ITM: {r.warning_text}")

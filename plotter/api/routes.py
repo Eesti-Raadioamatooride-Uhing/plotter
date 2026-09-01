@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import hashlib
 import hmac
 import json
 import logging
+import threading
 import math
 
 import numpy as np
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import (APIRouter, Body, HTTPException, Query, Request,
+                     Response)
 
 from ..config import settings
 from ..core.antennas.library import (ANTENNA_PRESETS, BANDS, BANDS_BY_KEY,
@@ -21,13 +24,17 @@ from ..core.propagation import coverage as cov
 from ..core.propagation import hf as hfmod
 from ..core.propagation import itm
 from ..core.propagation import linkbudget as lb
+from ..core.terrain import providers
 from ..core.terrain.profile import build_profile, horizon_distance_km
-from .schemas import CoverageRequest, HFRequest, LinkRequest, ProfileRequest
+from . import jobs
+from .schemas import (CoverageRequest, HFRequest, LinkRequest,
+                      ProfileRequest)
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
-_coverage_cache: dict[str, tuple[bytes, dict]] = {}
+def _runs(request: Request) -> jobs.Store:
+    return request.app.state.coverage_runs
 
 
 def _require_admin(request: Request) -> None:
@@ -118,13 +125,60 @@ def meta():
 @router.get("/health")
 def health(request: Request):
     t = _terrain(request)
-    return {"ok": True,
-            "terrain_providers": [p.name for p in t.providers],
-            "database": settings.database_url,
-            "time_utc": dt.datetime.utcnow().isoformat()}
+    out = {"ok": True,
+           "terrain_providers": [p.name for p in t.providers],
+           "terrain_readable": providers.HAVE_RASTERIO,
+           "database": settings.database_url,
+           "time_utc": dt.datetime.utcnow().isoformat()}
+    if not providers.HAVE_RASTERIO:
+        # Not fatal to the process, but every propagation answer is fiction,
+        # so it must not read as a healthy install.
+        out["ok"] = False
+        out["error"] = ("rasterio did not load, so no terrain can be read and "
+                        f"every elevation is 0 m: {providers.RASTERIO_ERROR}")
+    return out
 
 
 # ------------------------------------------------------------------ terrain
+
+@router.post("/terrain/warm")
+def terrain_warm(request: Request, lat: float = Body(...), lon: float = Body(...),
+                 radius_km: float = Body(60.0), max_tiles: int = Body(4)):
+    """Pre-fetch the elevation tiles a sweep from here would need.
+
+    Deliberately incremental: it fetches at most `max_tiles` per call and
+    reports what is left, so the browser can drive it with a progress bar
+    instead of a coverage request stalling for minutes behind a proxy that
+    eventually gives up. Stateless, so it does not care which worker answers.
+    """
+    radius_km = min(max(radius_km, 1.0), settings.max_coverage_range_km)
+    max_tiles = min(max(max_tiles, 1), 12)
+    dem = next((p for p in _terrain(request).providers
+                if isinstance(p, providers.CopernicusDEM)), None)
+    if dem is None:
+        return {"total": 0, "cached": 0, "fetched": 0, "remaining": 0,
+                "failed": 0, "note": "no Copernicus provider configured"}
+
+    cells = dem.tiles_for_disc(lat, lon, radius_km * 1000.0)
+    todo = [c for c in cells if not dem.is_cached(*c)]
+    fetched = failed = 0
+    for ilat, ilon in todo[:max_tiles]:
+        try:
+            dem._tile_path(ilat, ilon)
+            fetched += 1
+        except providers.TileFetchError as exc:
+            failed += 1
+            log.warning("warm: %s", exc)
+    return {
+        "total": len(cells),
+        "cached": len(cells) - len(todo) + fetched,
+        "fetched": fetched,
+        "remaining": max(0, len(todo) - fetched - failed),
+        "failed": failed,
+    }
+
+
+# ------------------------------------------------------------- terrain query
 
 @router.get("/elevation")
 def elevation(request: Request, lat: float, lon: float, high_res: bool = False):
@@ -165,8 +219,68 @@ def profile(request: Request, req: ProfileRequest):
 
 # --------------------------------------------------------------------- link
 
+def _link_key(req: LinkRequest) -> str:
+    body = json.dumps(req.model_dump(), sort_keys=True, default=str)
+    return "L" + hashlib.sha1(body.encode()).hexdigest()[:39]
+
+
 @router.post("/link")
 def link(request: Request, req: LinkRequest):
+    """Compute and return in one request. Kept for scripts and the CLI."""
+    return _run_link(_terrain(request), req)
+
+
+@router.post("/link/start")
+def link_start(request: Request, req: LinkRequest):
+    """Kick a path analysis off in the background and return immediately.
+
+    A long path over Estonia samples the Maa-amet 1 m DTM, which is hundreds
+    of separate WCS cells. That is minutes of fetching before any propagation
+    is computed, and holding one connection open for it is what produced the
+    timeout. Poll /link/job/{id} instead, the same way coverage does.
+    """
+    key = _link_key(req)
+    store = _runs(request)
+    store.reap_stale()
+    if store.result(key) is not None:
+        return {"id": key, "state": jobs.STATE_DONE, "progress": 1.0}
+    if not store.claim(key):
+        st = store.status(key) or {"state": jobs.STATE_RUNNING, "progress": 0.0}
+        return {"id": key, "state": st["state"],
+                "progress": st.get("progress", 0.0)}
+
+    terrain = _terrain(request)
+
+    def work():
+        try:
+            store.finish(key, _run_link(terrain, req), b"")
+        except HTTPException as exc:
+            store.fail(key, str(exc.detail))
+        except Exception as exc:                      # pragma: no cover
+            log.exception("link run %s failed", key)
+            store.fail(key, str(exc))
+
+    threading.Thread(target=work, name=f"link-{key[:8]}", daemon=True).start()
+    return {"id": key, "state": jobs.STATE_RUNNING, "progress": 0.0}
+
+
+@router.get("/link/job/{key}")
+def link_job(request: Request, key: str):
+    store = _runs(request)
+    st = store.status(key)
+    if st is None:
+        raise HTTPException(404, "no such link run")
+    if st["state"] == jobs.STATE_DONE:
+        result = store.result(key)
+        if result is None:
+            raise HTTPException(500, "the link result could not be read")
+        return {"state": jobs.STATE_DONE, "progress": 1.0, "result": result}
+    if st["state"] == jobs.STATE_ERROR:
+        raise HTTPException(500, st.get("error") or "the link run failed")
+    return {"state": st["state"], "progress": st.get("progress", 0.0)}
+
+
+def _run_link(terrain, req: LinkRequest):
     freq = _resolve_freq(req.band, req.freq_mhz, 5760.0)
     sens, bw = _mode(req.mode, req.sensitivity_dbm)
     if req.bandwidth_hz:
@@ -179,7 +293,7 @@ def link(request: Request, req: LinkRequest):
         raise HTTPException(400, f"path is {d/1000:.0f} km, longer than the "
                                  f"{settings.max_link_length_km:.0f} km limit")
 
-    prof = build_profile(_terrain(request), req.tx.lat, req.tx.lon,
+    prof = build_profile(terrain, req.tx.lat, req.tx.lon,
                          req.rx.lat, req.rx.lon, points=req.points,
                          high_res=req.high_res_terrain,
                          clutter_m=req.clutter_m)
@@ -210,9 +324,13 @@ def link(request: Request, req: LinkRequest):
                          clutter_m=req.clutter_m, climate=req.climate,
                          polarisation=req.polarisation, ground=req.ground,
                          target_availability_pct=req.availability_pct,
+                         reliability=req.reliability,
+                         confidence=req.confidence,
                          include_profile=req.include_profile)
     out = lb.to_dict(result)
     out["frequency_mhz"] = freq
+    out["s_meter"] = hfmod.s_meter_label(result.rx_level_dbm, freq)
+    out["s9_dbm"] = hfmod.s9_reference_dbm(freq)
     out["band"] = (band_for_frequency(freq).label
                    if band_for_frequency(freq) else None)
     out["mode"] = req.mode
@@ -233,6 +351,8 @@ def link(request: Request, req: LinkRequest):
                           climate=req.climate, polarisation=req.polarisation,
                           ground=req.ground,
                           target_availability_pct=req.availability_pct,
+                          reliability=req.reliability,
+                          confidence=req.confidence,
                           include_profile=False)
         out["reverse"] = {"rx_level_dbm": rev.rx_level_dbm,
                           "link_margin_db": rev.link_margin_db,
@@ -283,13 +403,16 @@ def best_heights(request: Request, req: LinkRequest):
 # ----------------------------------------------------------------- coverage
 
 def _coverage_key(req: CoverageRequest) -> str:
+    # The renderer is part of the identity of a stored run, not just the
+    # request: a palette change must produce a new key rather than serve the
+    # old picture from disk.
+    body = json.dumps(req.model_dump(), sort_keys=True, default=str)
     return hashlib.sha1(
-        json.dumps(req.model_dump(), sort_keys=True, default=str).encode()
-    ).hexdigest()
+        f"{body}|{cov.render_signature()}".encode()).hexdigest()
 
 
-@router.post("/coverage")
-def coverage(request: Request, req: CoverageRequest):
+def _prepare_coverage(req: CoverageRequest):
+    """Validate, clamp and turn an API request into an engine request."""
     freq = _resolve_freq(req.band, req.freq_mhz, 145.0)
     sens, _ = _mode(req.mode, req.sensitivity_dbm)
     if req.max_range_km > settings.max_coverage_range_km:
@@ -300,6 +423,22 @@ def coverage(request: Request, req: CoverageRequest):
     req.azimuth_step_deg = max(req.azimuth_step_deg, settings.min_azimuth_step_deg)
     req.range_step_m = max(req.range_step_m, settings.min_range_step_m)
     req.image_size = int(min(max(req.image_size, 100), settings.max_image_size))
+
+    # Keep the solve count inside the budget by coarsening both axes together,
+    # so a 2000 km request returns a real answer at a sane resolution rather
+    # than running for hours. Whatever we changed is reported, never silent.
+    notes: list[str] = []
+    n_az = max(8, round(360.0 / req.azimuth_step_deg))
+    n_r = max(4, int(req.max_range_km * 1000.0 / req.range_step_m) + 1)
+    budget = settings.max_coverage_points
+    if n_az * n_r > budget:
+        scale = math.sqrt(n_az * n_r / budget)
+        req.azimuth_step_deg = min(30.0, req.azimuth_step_deg * scale)
+        req.range_step_m = req.range_step_m * scale
+        notes.append(
+            f"Coarsened to {req.azimuth_step_deg:.2f} deg by "
+            f"{req.range_step_m:.0f} m to stay inside the "
+            f"{budget:,} path budget for a {req.max_range_km:.0f} km sweep.")
 
     key = _coverage_key(req)
     ant = _antenna(req.site.antenna, freq, req.ground)
@@ -315,10 +454,18 @@ def coverage(request: Request, req: CoverageRequest):
         ground=req.ground, climate=req.climate,
         polarisation=req.polarisation, reliability=req.reliability,
         confidence=req.confidence, k_factor=req.k_factor,
-        clutter_m=req.clutter_m, metric=req.metric)
+        clutter_m=req.clutter_m, metric=req.metric,
+        s9_dbm=hfmod.s9_reference_dbm(freq))
+    return key, freq, sens, ant, creq, notes
 
-    result = cov.compute(_terrain(request), creq,
-                         workers=settings.coverage_workers)
+
+def _run_coverage(terrain, req: CoverageRequest, key, freq, sens, ant, creq,
+                  notes=None, progress=None):
+    result = cov.compute(
+        terrain, creq, workers=settings.coverage_workers, progress=progress,
+        # Across processes, so the sweep uses the machine's cores instead of
+        # queueing behind the GIL.
+        terrain_factory=functools.partial(providers.terrain_factory, settings))
     png = cov.render_png(result, size=req.image_size)
     payload = {
         "id": key,
@@ -327,40 +474,116 @@ def coverage(request: Request, req: CoverageRequest):
         "stats": result.stats,
         "frequency_mhz": freq,
         "sensitivity_dbm": sens,
+        # The dBm that reads S9 at this frequency, so the map readout can turn
+        # a level into an S score without asking the server.
+        "s9_dbm": hfmod.s9_reference_dbm(freq),
+        "sensitivity_s_meter": hfmod.s_meter_label(sens, freq),
         "metric": req.metric,
         "antenna": ant.describe(),
+        # Ships with the response so the map readout can answer a mouse move
+        # locally instead of asking the server for every pixel.
+        "grid": cov.sample_grid(result),
         "site": {"lat": req.site.lat, "lon": req.site.lon,
                  "height_agl_m": req.site.height_agl_m,
                  "ground_amsl_m": round(float(result.lats.shape[0] and
                                               0.0), 1)},
         "horizon_km": round(horizon_distance_km(req.site.height_agl_m,
                                                 req.k_factor), 1),
-        "legend": [{"dbm": s[0], "rgba": list(s[1])} for s in cov.SIGNAL_STOPS],
+        "legend": cov.legend(hfmod.s9_reference_dbm(freq)),
     }
-    contours = cov.contour_geojson(result, [sens, sens + 10, sens + 20])
-    payload["contours"] = contours
-    _coverage_cache[key] = (png, payload)
-    if len(_coverage_cache) > 24:
-        for k in list(_coverage_cache)[:-24]:
-            _coverage_cache.pop(k, None)
+    payload["contours"] = cov.contour_geojson(result, [sens, sens + 10,
+                                                       sens + 20])
+    if notes:
+        payload["notes"] = list(notes)
+    return payload, png
+
+
+@router.post("/coverage")
+def coverage(request: Request, req: CoverageRequest):
+    """Compute and return in one request.
+
+    Kept for scripts and the CLI. The web UI uses /coverage/start instead,
+    because a fine-detail sweep outlives what a browser or a proxy will wait
+    for on a single connection.
+    """
+    key, freq, sens, ant, creq, notes = _prepare_coverage(req)
+    store = _runs(request)
+    cached = store.result(key)
+    if cached is not None:
+        return cached
+    payload, png = _run_coverage(_terrain(request), req, key, freq, sens, ant,
+                                 creq, notes)
+    store.claim(key)
+    store.finish(key, payload, png)
     return payload
 
 
+@router.post("/coverage/start")
+def coverage_start(request: Request, req: CoverageRequest):
+    """Kick the sweep off in the background and return immediately.
+
+    Poll /coverage/job/{id} for progress and the result. Identical requests
+    share a run rather than computing it twice.
+    """
+    key, freq, sens, ant, creq, notes = _prepare_coverage(req)
+    store = _runs(request)
+    store.reap_stale()
+    if store.result(key) is not None:
+        return {"id": key, "state": jobs.STATE_DONE, "progress": 1.0}
+    if not store.claim(key):
+        # Somebody already owns this run, done or in flight. Poll it.
+        st = store.status(key) or {"state": jobs.STATE_RUNNING, "progress": 0.0}
+        return {"id": key, "state": st["state"], "progress": st.get("progress", 0.0)}
+
+    terrain = _terrain(request)
+
+    def work():
+        try:
+            payload, png = _run_coverage(
+                terrain, req, key, freq, sens, ant, creq, notes,
+                progress=lambda f: store.set_status(key, jobs.STATE_RUNNING,
+                                                    progress=f))
+            store.finish(key, payload, png)
+        except Exception as exc:                      # pragma: no cover
+            log.exception("coverage run %s failed", key)
+            store.fail(key, str(exc))
+
+    threading.Thread(target=work, name=f"coverage-{key[:8]}",
+                     daemon=True).start()
+    return {"id": key, "state": jobs.STATE_RUNNING, "progress": 0.0}
+
+
+@router.get("/coverage/job/{key}")
+def coverage_job(request: Request, key: str):
+    store = _runs(request)
+    st = store.status(key)
+    if st is None:
+        raise HTTPException(404, "no such coverage run")
+    if st["state"] == jobs.STATE_DONE:
+        result = store.result(key)
+        if result is None:                            # written but unreadable
+            raise HTTPException(500, "the coverage result could not be read")
+        return {"state": jobs.STATE_DONE, "progress": 1.0, "result": result}
+    if st["state"] == jobs.STATE_ERROR:
+        raise HTTPException(500, st.get("error") or "the coverage run failed")
+    return {"state": st["state"], "progress": st.get("progress", 0.0)}
+
+
 @router.get("/coverage/{key}.png")
-def coverage_png(key: str):
-    hit = _coverage_cache.get(key)
-    if not hit:
+def coverage_png(request: Request, key: str):
+    png = _runs(request).png(key)
+    if png is None:
         raise HTTPException(404, "that coverage run has expired, re-run it")
-    return Response(content=hit[0], media_type="image/png",
+    return Response(content=png, media_type="image/png",
                     headers={"Cache-Control": "public, max-age=3600"})
 
 
 @router.get("/coverage/{key}.geojson")
-def coverage_geojson(key: str):
-    hit = _coverage_cache.get(key)
-    if not hit:
+def coverage_geojson(request: Request, key: str):
+    result = _runs(request).result(key)
+    if result is None:
         raise HTTPException(404, "that coverage run has expired, re-run it")
-    return hit[1]["contours"]
+    return result["contours"]
 
 
 # ----------------------------------------------------------------------- HF

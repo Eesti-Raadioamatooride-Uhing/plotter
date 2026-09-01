@@ -2,13 +2,17 @@
 
 Antenna deployment planning over real topography for Estonia and Finland,
 136 kHz to 24 GHz. FastAPI backend, vanilla Leaflet frontend, no build step.
-Deploys to a Linux server via venv + systemd.
+Dependencies are locked with uv, and it deploys as containers run by an
+ordinary user (no root, no system packages, no host venv).
 
 ## Deploy target
 
-`root@172.16.0.74`, reachable by SSH key from the user's Windows machine.
-See `deploy/DEPLOY.md` for the rsync + `install.sh` flow. The installer is
-idempotent — re-run it after every sync to upgrade.
+`172.16.0.74`, reachable by SSH key from the user's Windows machine, as an
+unprivileged user in the `docker` group. See `deploy/DEPLOY.md` for the
+rsync + `deploy/deploy.sh` flow. The script is idempotent, so re-run it after
+every sync to upgrade. State lives in `~/.local/share/plotter`, config in
+`./.env`, and the maintenance CLI runs as
+`docker compose run --rm --no-deps app plotter-refresh ...`.
 
 ## Layout
 
@@ -48,9 +52,16 @@ plotter/static/                    index.html + style.css + app.js, no bundler
 ## Testing
 
 ```bash
-python -m pytest tests -q          # 33 tests, all passing
-python -m pyflakes plotter tests    # clean
+make check                         # 33 tests plus pyflakes, both clean
 ```
+
+`make` with no target lists everything (`up`, `dev`, `serve`, `warm`,
+`refresh`, `logs`, `down`, `lock` and the rest). The targets are thin wrappers
+over `deploy/deploy.sh`, `docker compose` and `uv`, so either style works.
+
+Dependency changes go through `pyproject.toml` plus `uv lock`. There is no
+`requirements.txt` any more, and the image installs from `uv.lock`, so an
+unlocked dependency will fail the build rather than drift.
 
 Tests check against published reference values (free-space loss at 1 GHz/1 km,
 the P.526 knife-edge curve, P.838 rain coefficients, the 4.12·√h horizon rule,

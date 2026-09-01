@@ -241,12 +241,31 @@ class HFPrediction:
     notes: list[str] = field(default_factory=list)
 
 
-def s_meter_label(dbm: float) -> str:
-    """S-meter using the IARU Region 1 HF reference: S9 = -73 dBm."""
-    if dbm >= -73.0:
-        over = dbm + 73.0
+# IARU Region 1 Technical Recommendation R.1. S9 is 50 uV at the receiver
+# input on HF and 5 uV above 30 MHz, which is 20 dB apart, and one S unit is
+# 6 dB on both. Reading a 2 m signal against the HF reference reports it a
+# full 20 dB (more than three S units) low.
+S9_HF_DBM = -73.0
+S9_VHF_DBM = -93.0
+HF_LIMIT_MHZ = 30.0
+
+
+def s9_reference_dbm(freq_mhz: float) -> float:
+    """The dBm that reads S9 on a correctly calibrated meter at this frequency."""
+    return S9_HF_DBM if freq_mhz < HF_LIMIT_MHZ else S9_VHF_DBM
+
+
+def s_meter_label(dbm: float, freq_mhz: float | None = None) -> str:
+    """S-meter reading, e.g. "S7" or "S9+20 dB".
+
+    Without a frequency this keeps the HF reference, which is what the HF
+    predictor wants and what every existing caller assumed.
+    """
+    ref = S9_HF_DBM if freq_mhz is None else s9_reference_dbm(freq_mhz)
+    if dbm >= ref:
+        over = dbm - ref
         return f"S9+{int(round(over))} dB" if over >= 1 else "S9"
-    s = 9.0 + (dbm + 73.0) / 6.0
+    s = 9.0 + (dbm - ref) / 6.0
     if s < 0.5:
         return "below S1"
     return f"S{int(round(max(1.0, s)))}"

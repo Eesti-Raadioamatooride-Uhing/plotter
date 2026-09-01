@@ -10,9 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .api import jobs
 from .api.routes import router
 from .config import settings
 from .core.data import db
+from .core.terrain import providers
 from .core.terrain.providers import Terrain
 
 STATIC = Path(__file__).parent / "static"
@@ -26,9 +28,22 @@ async def lifespan(app: FastAPI):
     settings.ensure_dirs()
     db.init(settings.database_url)
     app.state.terrain = Terrain.from_settings(settings)
-    logging.getLogger(__name__).info(
-        "terrain providers: %s",
-        ", ".join(p.name for p in app.state.terrain.providers))
+    # Coverage results live on disk, not in this worker's memory: several
+    # uvicorn workers answer the same browser, and the image request rarely
+    # lands on the worker that computed it.
+    app.state.coverage_runs = jobs.Store(settings.data_dir)
+    app.state.coverage_runs.reap_stale()
+    log = logging.getLogger(__name__)
+    log.info("terrain providers: %s",
+             ", ".join(p.name for p in app.state.terrain.providers))
+    if not providers.HAVE_RASTERIO:
+        # Every elevation read returns nodata, which becomes 0 m, so the app
+        # would quietly model the whole country as a flat sea. Say so loudly:
+        # a wrong number that looks plausible is worse than no number.
+        log.error("rasterio did not load (%s). NO TERRAIN will be read: every "
+                  "elevation reads as 0 m and every propagation result is "
+                  "fiction. On Debian slim images this is usually a missing "
+                  "libexpat1.", providers.RASTERIO_ERROR)
     if settings.refresh_on_start:
         from .core.data import masts
         try:

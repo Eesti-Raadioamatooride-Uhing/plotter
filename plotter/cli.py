@@ -37,19 +37,25 @@ def cmd_discover(args) -> int:
 def cmd_warm(args) -> int:
     """Pre-download the Copernicus tiles covering Estonia and Finland."""
     from .config import settings
-    from .core.terrain.providers import CopernicusDEM
+    from .core.terrain.providers import CopernicusDEM, TileFetchError
     from pathlib import Path
     dem = CopernicusDEM(Path(settings.cache_dir), settings.copernicus_bucket)
-    got = missing = 0
+    got = missing = failed = 0
     for lat in range(args.min_lat, args.max_lat):
         for lon in range(args.min_lon, args.max_lon):
-            p = dem._tile_path(lat, lon)
+            try:
+                p = dem._tile_path(lat, lon)
+            except TileFetchError as exc:
+                failed += 1
+                print(f"  {dem.tile_name(lat, lon)}  FAILED: {exc}")
+                continue
             if p:
                 got += 1
                 print(f"  {dem.tile_name(lat, lon)}  ok")
             else:
                 missing += 1
-    print(f"{got} tiles cached, {missing} unavailable (sea or outside coverage)")
+    print(f"{got} tiles cached, {missing} unavailable (sea or outside coverage)"
+          + (f", {failed} failed and will be retried next run" if failed else ""))
     return 0
 
 
