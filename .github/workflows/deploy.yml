@@ -1,0 +1,32 @@
+name: Deploy to server
+
+# Deploys only on a push to main (and manual dispatch). Deliberately NOT on
+# pull_request: this repo is public and runs on a self-hosted runner on the
+# production LAN box, so a forked PR must never be able to execute here.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never let two deploys run at once against the same server.
+concurrency:
+  group: deploy-server
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Targets the self-hosted runner installed on 172.16.0.74 (label "plotter").
+    runs-on: [self-hosted, plotter]
+    steps:
+      - name: Check out the pushed code
+        uses: actions/checkout@v4
+
+      - name: Install / upgrade Plotter on the server
+        run: |
+          chmod +x deploy/install.sh
+          BIND=0.0.0.0 ./deploy/install.sh
+
+      - name: Health check
+        run: |
+          curl -fsS --max-time 15 http://127.0.0.1:8088/api/health
+          echo
