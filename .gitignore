@@ -1,9 +1,11 @@
 __pycache__/
 *.py[cod]
-venv/
+/venv/
 .venv/
 .env
-data/
+# Anchored to the repo root: the runtime elevation/tile cache lives in ./data,
+# but plotter/core/data is a source package and must NOT be ignored.
+/data/
 *.sqlite
 *.tif
 .pytest_cache/
