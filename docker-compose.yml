@@ -1,0 +1,44 @@
+# Plotter runs as two containers:
+#   app  - the FastAPI/uvicorn service, reachable ONLY on the internal network
+#   waf  - Apache httpd + ModSecurity v3 + OWASP Core Rule Set, the only thing
+#          published to the host (:8088, which Cloudflare's origin pull hits).
+# All public traffic is therefore filtered by the WAF before it reaches the app.
+
+services:
+  app:
+    build: .
+    image: plotter-app:latest
+    restart: unless-stopped
+    # Run as the host's plotter user so the bind-mounted state stays writable
+    # and the host-side nightly refresh (same uid) shares it.
+    user: "997:988"
+    env_file:
+      - /etc/plotter/plotter.env
+    environment:
+      PLOTTER_HOST: "0.0.0.0"
+      PLOTTER_PORT: "8000"
+    volumes:
+      - /var/lib/plotter:/var/lib/plotter
+    expose:
+      - "8000"
+
+  waf:
+    image: owasp/modsecurity-crs:apache
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      SERVERNAME: "plotter.erau.ee"
+      BACKEND: "http://app:8000"
+      PORT: "8080"
+      # Actively block, at CRS paranoia level 1, with a slightly relaxed
+      # inbound anomaly threshold so the app's own JSON API isn't false-flagged.
+      MODSEC_RULE_ENGINE: "On"
+      PARANOIA: "1"
+      ANOMALY_INBOUND: "10"
+      ANOMALY_OUTBOUND: "6"
+      # Coverage/link computations can take a while behind the proxy.
+      PROXY_TIMEOUT: "180"
+      MODSEC_REQ_BODY_LIMIT: "1048576"
+    ports:
+      - "8088:8080"
