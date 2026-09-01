@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly Plotter data refresh
+
+[Timer]
+# Off-peak, and jittered so every install does not hit the same servers
+# at the same second.
+OnCalendar=*-*-* 03:20:00
+RandomizedDelaySec=45m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,47 @@
+[Unit]
+Description=Plotter antenna planning service
+Documentation=https://github.com/Eesti-Raadioamatooride-Uhing/plotter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=plotter
+Group=plotter
+WorkingDirectory=/opt/plotter
+EnvironmentFile=-/etc/plotter/plotter.env
+ExecStart=/opt/plotter/venv/bin/uvicorn plotter.main:app \
+    --host ${PLOTTER_HOST} --port ${PLOTTER_PORT} --workers ${PLOTTER_WORKERS} \
+    --proxy-headers --forwarded-allow-ips '127.0.0.1'
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# Hardening. Plotter needs outbound HTTPS and its own state directory,
+# nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+StateDirectory=plotter
+ReadWritePaths=/var/lib/plotter
+# No IPAddress filter: the service needs broad outbound HTTPS for elevation
+# tiles, Overpass, the ionosonde and the register. A deny-any rule with an
+# 0.0.0.0/0 allow underneath it only looks like hardening.
+
+[Install]
+WantedBy=multi-user.target

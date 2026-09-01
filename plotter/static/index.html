@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plotter — antenna planning for Estonia &amp; Finland</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+<div id="app">
+  <aside id="panel">
+    <header>
+      <h1>plot<span>ter</span></h1>
+      <div class="sub">Antenna planning · Estonia &amp; Finland · HF → microwave</div>
+    </header>
+
+    <nav class="tabs">
+      <button data-tab="coverage" class="active">Coverage</button>
+      <button data-tab="link">Link</button>
+      <button data-tab="hf">HF</button>
+      <button data-tab="data">Data</button>
+    </nav>
+
+    <!-- ============================================ COVERAGE -->
+    <section class="tab" id="tab-coverage">
+      <div class="hint">Place a station and predict how far it is heard. Uses
+        Longley&#8209;Rice over real terrain.</div>
+
+      <div class="site-block" data-site="cov">
+        <div class="row">
+          <label>Station</label>
+          <button class="pick" data-target="cov">Pick on map</button>
+        </div>
+        <div class="row two">
+          <div><label>Latitude</label><input id="cov-lat" type="number" step="0.00001" value="59.4370"></div>
+          <div><label>Longitude</label><input id="cov-lon" type="number" step="0.00001" value="24.7536"></div>
+        </div>
+        <div class="row two">
+          <div><label>Antenna height <span class="u">m AGL</span></label><input id="cov-h" type="number" step="1" value="20"></div>
+          <div><label>Ground <span class="u">m AMSL</span></label><input id="cov-amsl" type="text" readonly placeholder="—"></div>
+        </div>
+      </div>
+
+      <div class="row two">
+        <div><label>Band</label><select id="cov-band"></select></div>
+        <div><label>Frequency <span class="u">MHz</span></label><input id="cov-freq" type="number" step="0.001" value="145"></div>
+      </div>
+      <div class="row two">
+        <div><label>Power <span class="u">W</span></label><input id="cov-pwr" type="number" step="1" value="25"></div>
+        <div><label>Feedline loss <span class="u">dB</span></label><input id="cov-feed" type="number" step="0.1" value="1.5"></div>
+      </div>
+      <div class="row two">
+        <div><label>Antenna</label><select id="cov-ant"></select></div>
+        <div><label>Gain / bearing</label>
+          <div class="inline"><input id="cov-gain" type="number" step="0.1" value="6" title="Gain, dBi"><input id="cov-bear" type="number" step="1" value="0" title="Boresight bearing, degrees"></div>
+        </div>
+      </div>
+      <div class="row two">
+        <div><label>Receiver</label><select id="cov-mode"></select></div>
+        <div><label>RX height <span class="u">m</span></label><input id="cov-rxh" type="number" step="0.5" value="2"></div>
+      </div>
+      <div class="row two">
+        <div><label>Range <span class="u">km</span></label><input id="cov-range" type="number" step="5" value="60"></div>
+        <div><label>Detail</label><select id="cov-detail">
+          <option value="fast">Fast (2°, 1 km)</option>
+          <option value="normal" selected>Normal (2°, 500 m)</option>
+          <option value="fine">Fine (1°, 250 m)</option>
+        </select></div>
+      </div>
+      <details class="adv">
+        <summary>Advanced</summary>
+        <div class="row two">
+          <div><label>Ground</label><select id="cov-ground"></select></div>
+          <div><label>Climate</label><select id="cov-climate"></select></div>
+        </div>
+        <div class="row two">
+          <div><label>Reliability</label><select id="cov-rel">
+            <option value="0.5">50 % of locations</option>
+            <option value="0.9" selected>90 % of locations</option>
+            <option value="0.95">95 % of locations</option>
+          </select></div>
+          <div><label>Clutter <span class="u">m</span></label><input id="cov-clutter" type="number" step="1" value="0" title="Add trees/buildings on top of the bare terrain"></div>
+        </div>
+        <div class="row two">
+          <div><label>k factor</label><input id="cov-k" type="number" step="0.05" value="1.333"></div>
+          <div><label>Show</label><select id="cov-metric">
+            <option value="signal" selected>Signal level</option>
+            <option value="margin">Margin over sensitivity</option>
+            <option value="loss">Path loss</option>
+            <option value="los">Line of sight only</option>
+          </select></div>
+        </div>
+      </details>
+
+      <button class="go" id="cov-run">Predict coverage</button>
+      <button class="ghost" id="cov-horizon">Show radio horizon</button>
+      <div class="result" id="cov-result"></div>
+    </section>
+
+    <!-- ================================================ LINK -->
+    <section class="tab hidden" id="tab-link">
+      <div class="hint">Point-to-point path between two sites: terrain profile,
+        Fresnel clearance, aiming angles and the full budget.</div>
+
+      <div class="site-block">
+        <div class="row"><label>End A</label><button class="pick" data-target="a">Pick on map</button></div>
+        <div class="row two">
+          <div><input id="a-lat" type="number" step="0.00001" value="59.4370" placeholder="lat"></div>
+          <div><input id="a-lon" type="number" step="0.00001" value="24.7536" placeholder="lon"></div>
+        </div>
+        <div class="row three">
+          <div><label>Height <span class="u">m</span></label><input id="a-h" type="number" value="25"></div>
+          <div><label>Power <span class="u">W</span></label><input id="a-p" type="number" step="0.1" value="0.5"></div>
+          <div><label>Loss <span class="u">dB</span></label><input id="a-f" type="number" step="0.1" value="1.5"></div>
+        </div>
+        <div class="row two">
+          <div><label>Antenna</label><select id="a-ant"></select></div>
+          <div><label>Gain / size</label><input id="a-gain" type="number" step="0.1" value="28"></div>
+        </div>
+      </div>
+
+      <div class="site-block">
+        <div class="row"><label>End B</label><button class="pick" data-target="b">Pick on map</button></div>
+        <div class="row two">
+          <div><input id="b-lat" type="number" step="0.00001" value="59.3960" placeholder="lat"></div>
+          <div><input id="b-lon" type="number" step="0.00001" value="24.6650" placeholder="lon"></div>
+        </div>
+        <div class="row three">
+          <div><label>Height <span class="u">m</span></label><input id="b-h" type="number" value="20"></div>
+          <div><label>Power <span class="u">W</span></label><input id="b-p" type="number" step="0.1" value="0.5"></div>
+          <div><label>Loss <span class="u">dB</span></label><input id="b-f" type="number" step="0.1" value="1.5"></div>
+        </div>
+        <div class="row two">
+          <div><label>Antenna</label><select id="b-ant"></select></div>
+          <div><label>Gain / size</label><input id="b-gain" type="number" step="0.1" value="28"></div>
+        </div>
+      </div>
+
+      <div class="row two">
+        <div><label>Band</label><select id="lnk-band"></select></div>
+        <div><label>Frequency <span class="u">MHz</span></label><input id="lnk-freq" type="number" step="0.1" value="5760"></div>
+      </div>
+      <div class="row two">
+        <div><label>Radio / mode</label><select id="lnk-mode"></select></div>
+        <div><label>Availability <span class="u">%</span></label><select id="lnk-avail">
+          <option>99</option><option selected>99.9</option><option>99.99</option><option>99.999</option>
+        </select></div>
+      </div>
+      <details class="adv">
+        <summary>Advanced</summary>
+        <div class="row two">
+          <div><label>Ground</label><select id="lnk-ground"></select></div>
+          <div><label>Polarisation</label><select id="lnk-pol">
+            <option value="vertical" selected>Vertical</option>
+            <option value="horizontal">Horizontal</option>
+          </select></div>
+        </div>
+        <div class="row two">
+          <div><label>k factor</label><input id="lnk-k" type="number" step="0.05" value="1.333"></div>
+          <div><label>Clutter <span class="u">m</span></label><input id="lnk-clutter" type="number" step="1" value="0"></div>
+        </div>
+        <label class="check"><input type="checkbox" id="lnk-hires" checked> Use high-resolution terrain (slower)</label>
+        <label class="check"><input type="checkbox" id="lnk-buildings" checked> Show ETAK building heights (Estonia)</label>
+      </details>
+
+      <button class="go" id="lnk-run">Analyse path</button>
+      <button class="ghost" id="lnk-terrain">Terrain profile</button>
+      <button class="ghost" id="lnk-heights">Height matrix</button>
+      <div class="result" id="lnk-result"></div>
+    </section>
+
+    <!-- ================================================== HF -->
+    <section class="tab hidden" id="tab-hf">
+      <div class="hint">What a wire antenna actually does. The elevation pattern
+        decides which hop distances you can work — that is the whole game on HF.</div>
+
+      <div class="site-block">
+        <div class="row"><label>Station</label><button class="pick" data-target="hf">Pick on map</button></div>
+        <div class="row two">
+          <div><input id="hf-lat" type="number" step="0.00001" value="59.4370" placeholder="lat"></div>
+          <div><input id="hf-lon" type="number" step="0.00001" value="24.7536" placeholder="lon"></div>
+        </div>
+      </div>
+      <div class="row two">
+        <div><label>Band</label><select id="hf-band"></select></div>
+        <div><label>Power <span class="u">W</span></label><input id="hf-pwr" type="number" value="100"></div>
+      </div>
+      <div class="row two">
+        <div><label>Antenna</label><select id="hf-ant"></select></div>
+        <div><label>Height <span class="u">m</span></label><input id="hf-h" type="number" step="0.5" value="12"></div>
+      </div>
+      <div class="row two">
+        <div><label>Wire bearing <span class="u">°</span></label><input id="hf-orient" type="number" value="90"></div>
+        <div><label>Ground</label><select id="hf-ground"></select></div>
+      </div>
+      <div class="row two">
+        <div><label>Mode</label><select id="hf-mode"></select></div>
+        <div><label>Time <span class="u">UTC</span></label><input id="hf-when" type="datetime-local"></div>
+      </div>
+      <label class="check"><input type="checkbox" id="hf-live" checked> Use live ionosonde &amp; solar data</label>
+
+      <button class="go" id="hf-run">Predict</button>
+      <div class="result" id="hf-result"></div>
+    </section>
+
+    <!-- ================================================ DATA -->
+    <section class="tab hidden" id="tab-data">
+      <div class="hint">Masts, towers and the licensed-transmitter register.</div>
+      <label class="check"><input type="checkbox" id="layer-masts"> Masts &amp; towers (OSM / ETAK)</label>
+      <label class="check"><input type="checkbox" id="layer-tx"> Registered transmitters</label>
+      <label class="check"><input type="checkbox" id="layer-tx-am" checked> &nbsp;&nbsp;amateur only</label>
+      <div class="row"><label>Search</label><input id="data-search" type="text" placeholder="callsign, name or licensee"></div>
+      <button class="ghost" id="data-reload">Reload for this view</button>
+      <div class="result" id="data-result"></div>
+      <div class="hr"></div>
+      <button class="ghost" id="data-refresh-masts">Refresh masts from OSM/ETAK</button>
+      <button class="ghost" id="data-discover">Check the JVIS portal</button>
+      <button class="ghost" id="data-refresh-jvis">Harvest JVIS register</button>
+      <div class="result small" id="data-admin"></div>
+    </section>
+  </aside>
+
+  <main id="map"></main>
+
+  <div id="profile" class="hidden">
+    <div class="profile-head">
+      <span id="profile-title">Path profile</span>
+      <button id="profile-close">×</button>
+    </div>
+    <canvas id="profile-canvas"></canvas>
+  </div>
+
+  <div id="toast" class="hidden"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="/static/app.js?v=3"></script>
+</body>
+</html>

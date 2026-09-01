@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plotter"
+version = "1.0.0"
+description = "Antenna deployment planning for Estonia and Finland, HF through microwave"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110", "uvicorn[standard]>=0.27", "pydantic>=2.6",
+  "pydantic-settings>=2.2", "numpy>=1.26", "rasterio>=1.3", "pyproj>=3.6",
+  "httpx>=0.27", "Pillow>=10.2", "SQLAlchemy>=2.0", "beautifulsoup4>=4.12",
+  "lxml>=5.1",
+]
+
+[project.scripts]
+plotter = "plotter.main:main"
+plotter-refresh = "plotter.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["plotter*"]
+
+[tool.setuptools.package-data]
+plotter = ["static/*"]
