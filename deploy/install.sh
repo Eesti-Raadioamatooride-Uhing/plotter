@@ -68,8 +68,11 @@ install -m 644 "$APP_DIR/deploy/plotter.service" /etc/systemd/system/
 install -m 644 "$APP_DIR/deploy/plotter-refresh.service" /etc/systemd/system/
 install -m 644 "$APP_DIR/deploy/plotter-refresh.timer" /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now plotter.service
-systemctl enable --now plotter-refresh.timer
+# enable for boot, then restart so an upgrade actually loads the new code
+# (enable --now is a no-op on an already-running service).
+systemctl enable plotter.service plotter-refresh.timer >/dev/null 2>&1 || true
+systemctl restart plotter.service
+systemctl start plotter-refresh.timer
 
 say "Waiting for the service to answer"
 CHECK_HOST=$BIND
