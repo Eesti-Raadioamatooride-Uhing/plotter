@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -27,6 +28,24 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 _coverage_cache: dict[str, tuple[bytes, dict]] = {}
+
+
+def _require_admin(request: Request) -> None:
+    """Gate the scrape/admin endpoints (they mutate state and hammer external
+    services). With an admin key configured, require it in the X-Admin-Key
+    header; without one, allow only loopback callers so these are never open
+    to the public internet."""
+    key = settings.admin_key
+    if key:
+        supplied = request.headers.get("X-Admin-Key", "")
+        if not hmac.compare_digest(supplied, key):
+            raise HTTPException(403, "admin key required")
+        return
+    client = request.client.host if request.client else ""
+    if client not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(403, "this endpoint is disabled on public "
+                                 "deployments; set PLOTTER_ADMIN_KEY and send "
+                                 "an X-Admin-Key header, or run it on the host")
 
 
 def _terrain(request: Request):
@@ -276,6 +295,11 @@ def coverage(request: Request, req: CoverageRequest):
     if req.max_range_km > settings.max_coverage_range_km:
         raise HTTPException(400, f"max_range_km is capped at "
                                  f"{settings.max_coverage_range_km:.0f}")
+    # Clamp the cost drivers so one request can't spin up millions of ITM
+    # paths or a giant raster and starve the box.
+    req.azimuth_step_deg = max(req.azimuth_step_deg, settings.min_azimuth_step_deg)
+    req.range_step_m = max(req.range_step_m, settings.min_range_step_m)
+    req.image_size = int(min(max(req.image_size, 100), settings.max_image_size))
 
     key = _coverage_key(req)
     ant = _antenna(req.site.antenna, freq, req.ground)
@@ -462,8 +486,9 @@ def registry_status():
 
 
 @router.get("/registry/jvis/discover")
-def jvis_discover():
+def jvis_discover(request: Request):
     """Report what the JVIS public module looks like right now."""
+    _require_admin(request)
     sc = jvis.JVISScraper(settings.jvis_base_url, settings.jvis_module_path,
                           settings.jvis_user_agent,
                           settings.jvis_request_delay_s,
@@ -473,7 +498,9 @@ def jvis_discover():
 
 
 @router.post("/registry/refresh")
-def registry_refresh(source: str = Query("all", pattern="^(all|jvis|masts)$")):
+def registry_refresh(request: Request,
+                     source: str = Query("all", pattern="^(all|jvis|masts)$")):
+    _require_admin(request)
     out = {}
     if source in ("all", "masts"):
         n, msg = masts.run(settings)

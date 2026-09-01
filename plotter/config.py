@@ -18,6 +18,18 @@ class Settings(BaseSettings):
     base_path: str = ""
     cors_origins: str = ""
 
+    # --- web app hardening
+    # Scrape/admin endpoints (registry refresh + JVIS discover) require this
+    # key in an X-Admin-Key header. When empty, those endpoints are reachable
+    # only from localhost, never from the public internet.
+    admin_key: str = ""
+    enable_docs: bool = False        # expose /docs, /redoc, /openapi.json
+    max_body_bytes: int = 262144     # reject request bodies larger than 256 KiB
+    # Cost ceilings so a single coverage request cannot exhaust the CPU.
+    min_azimuth_step_deg: float = 0.5
+    min_range_step_m: float = 100.0
+    max_image_size: int = 2000
+
     # --- storage
     data_dir: Path = Path("./data")
     cache_dir: Path = Path("./data/cache")
