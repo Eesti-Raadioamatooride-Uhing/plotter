@@ -13,7 +13,7 @@ from __future__ import annotations
 import io
 import logging
 import math
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -45,6 +45,9 @@ class CoverageRequest:
     ground: str = "average"
     climate: int = itm.CLIMATE_MARITIME_TEMPERATE_LAND
     polarisation: str = "vertical"
+    # The level that reads S9 on this band: -73 dBm on HF, -93 dBm above
+    # 30 MHz (IARU Region 1). The colour bands hang off it.
+    s9_dbm: float = -93.0
     reliability: float = 0.9
     confidence: float = 0.5
     k_factor: float = 4.0 / 3.0
@@ -102,7 +105,9 @@ def _radial(terrain, req: CoverageRequest, az: float, n_r: int,
         los[i] = rx_slope >= max_slope
         max_slope = max(max_slope, slope)
 
-        prof = [float(i), spacing] + [float(v) for v in surf[:i + 1]]
+        # .tolist() rather than a float() comprehension: this runs once per
+        # range step per radial, so it is the single hottest line in a sweep.
+        prof = [float(i), spacing] + surf[:i + 1].tolist()
         try:
             r = itm.point_to_point(
                 prof, max(req.height_agl_m, 0.5), max(req.rx_height_agl_m, 0.5),
@@ -126,7 +131,42 @@ def _radial(terrain, req: CoverageRequest, az: float, n_r: int,
     return lats, lons, signal, los, loss
 
 
-def compute(terrain, req: CoverageRequest, workers: int = 8) -> CoverageResult:
+# --- process pool -----------------------------------------------------------
+#
+# The ITM port is pure Python, so a thread pool buys nothing on it: measured on
+# a 32 core box, one worker did a sweep in 0.68 s and eight did it in 0.78 s,
+# because the GIL serialises every solve and the pool only adds contention.
+# Real cores need real processes.
+#
+# Each worker builds its own Terrain rather than inheriting one across the
+# fork: GDAL file handles do not survive being forked, and one solver per path
+# is what the ITM port requires anyway.
+
+_W: dict = {}
+
+
+def _init_worker(terrain_factory, req, n_r, ranges) -> None:
+    _W["terrain"] = terrain_factory()
+    _W["req"] = req
+    _W["n_r"] = n_r
+    _W["ranges"] = ranges
+
+
+def _radial_task(k_az):
+    k, az = k_az
+    return k, _radial(_W["terrain"], _W["req"], az, _W["n_r"], _W["ranges"])
+
+
+def compute(terrain, req: CoverageRequest, workers: int = 8,
+            progress=None, terrain_factory=None) -> CoverageResult:
+    """Sweep every radial. `progress` is called with 0..1 as radials land, so
+    a long run can report itself instead of looking hung.
+
+    `terrain_factory` is a picklable callable returning a Terrain. Given one,
+    the sweep runs across processes and actually uses the machine; without
+    one it falls back to threads, which is right for a small sweep where
+    process startup would cost more than it saves.
+    """
     n_az = max(8, int(round(360.0 / max(req.azimuth_step_deg, 0.25))))
     azimuths = np.linspace(0.0, 360.0, n_az, endpoint=False)
     n_r = max(4, int(req.max_range_km * 1000.0 / max(req.range_step_m, 25.0)) + 1)
@@ -141,13 +181,32 @@ def compute(terrain, req: CoverageRequest, workers: int = 8) -> CoverageResult:
     def job(k: int):
         return k, _radial(terrain, req, float(azimuths[k]), n_r, ranges)
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for k, (la, lo, sg, ls, lss) in ex.map(job, range(n_az)):
+    # Process startup and the pickling of each result cost something, so only
+    # pay it when there is enough work to win it back.
+    use_procs = (terrain_factory is not None and workers > 1
+                 and n_az * n_r >= 20000)
+    if use_procs:
+        pool = ProcessPoolExecutor(
+            max_workers=workers, initializer=_init_worker,
+            initargs=(terrain_factory, req, n_r, ranges))
+        tasks = pool.map(_radial_task,
+                         [(k, float(azimuths[k])) for k in range(n_az)],
+                         chunksize=max(1, n_az // (workers * 4)))
+    else:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        tasks = pool.map(job, range(n_az))
+
+    try:
+        for done, (k, (la, lo, sg, ls, lss)) in enumerate(tasks, start=1):
             lats[k] = la
             lons[k] = lo
             sig[k] = sg
             los[k] = ls
             loss[k] = lss
+            if progress is not None and (done % 4 == 0 or done == n_az):
+                progress(done / n_az)
+    finally:
+        pool.shutdown()
 
     if req.metric == "loss":
         values = loss
@@ -181,21 +240,104 @@ def compute(terrain, req: CoverageRequest, workers: int = 8) -> CoverageResult:
                           })
 
 
+def sample_grid(result: CoverageResult, max_cells: int = 60000) -> dict:
+    """The polar value grid, small enough to ship to the browser.
+
+    The map readout wants a value under the cursor without a round trip per
+    mouse move, so the grid travels with the response. A hover hint does not
+    need 0.1 dB or 250 m resolution, so decimate to a cell budget and round.
+    """
+    v = result.values
+    n_az, n_r = v.shape
+    stride_r = max(1, math.ceil(n_az * n_r / max(max_cells, 1)))
+    v = v[:, ::stride_r]
+    rng = result.ranges_m[::stride_r]
+    # Range 0 is the station itself and carries a sentinel (999 dBm signal,
+    # 0 dB loss) rather than a propagation answer, and -999 marks a radial
+    # step that was not computed. JSON has no NaN, so both become null.
+    def cell(x, i):
+        if i == 0 or not np.isfinite(x) or x <= -998.0 or x >= 998.0:
+            return None
+        return round(float(x), 1)
+
+    rows = [[cell(x, i) for i, x in enumerate(row)] for row in v]
+    return {
+        "azimuth_step_deg": float(360.0 / n_az),
+        "range_step_m": float(rng[1] - rng[0]) if len(rng) > 1 else 0.0,
+        "n_az": int(n_az), "n_r": int(v.shape[1]),
+        "metric": result.request.metric,
+        "values": rows,
+    }
+
+
 # --------------------------------------------------------------------- render
 
-# Signal-strength ramp. Chosen so the strong end reads clearly on both light
-# and dark basemaps, and so the steps land on values a radio amateur thinks in.
-SIGNAL_STOPS = [
-    (-120, (49, 54, 149, 150)),
-    (-110, (69, 117, 180, 165)),
-    (-100, (116, 173, 209, 175)),
-    (-90, (171, 217, 233, 180)),
-    (-80, (255, 255, 191, 185)),
-    (-70, (254, 224, 144, 190)),
-    (-60, (253, 174, 97, 195)),
-    (-50, (244, 109, 67, 200)),
-    (-40, (215, 48, 39, 205)),
+# Signal-strength ramp, banded on S-meter units.
+#
+# Blue -> cyan -> green -> yellow -> red -> deep red, the convention every RF
+# coverage tool uses (SPLAT!, Radio Mobile, the commercial planners). General
+# data-viz guidance says sequential magnitude takes one hue and never a
+# rainbow, and that is right for a reader with no prior. This reader has a
+# strong one: an operator reads these maps daily and already knows red is loud
+# and blue is barely there, so the convention wins.
+#
+# What that guidance is actually protecting against is real, so it is handled
+# rather than ignored. The six hexes were picked by running the palette
+# validator, not by eye: worst adjacent pair is 17.3 delta-E under protanopia
+# and 19.9 under normal vision (target 8 and 15), so neighbouring bands stay
+# apart for red-green colour blindness. Alpha also rises with signal, giving
+# a second channel that survives any colour vision at all. The two ends sit
+# outside the validator's categorical lightness band on purpose: that check
+# keeps peer series from out-shouting each other, and these are not peers.
+#
+# Band edges are dB relative to S9, all multiples of 6, so every edge in the
+# picture is a whole S unit that the legend names.
+SIGNAL_BANDS = [
+    # (dB relative to S9 where the band starts, label, RGB, alpha)
+    (-48.0, "S1-S2", (43, 108, 176), 140),
+    (-36.0, "S3-S4", (0, 180, 216), 158),
+    (-24.0, "S5-S6", (64, 160, 43), 176),
+    (-12.0, "S7-S8", (255, 212, 59), 194),
+    (0.0, "S9", (224, 49, 49), 208),
+    (20.0, "S9+20", (139, 0, 0), 222),
 ]
+
+# Bumped when the rendering changes in a way that makes a stored run stale.
+# The palette itself is hashed into the run key, so this is only for changes
+# the bands do not describe (geometry, banding rule, image encoding).
+RENDER_VERSION = 3
+
+
+def render_signature() -> str:
+    """Identifies this renderer, so cached runs do not survive a change to it.
+
+    Coverage results are cached on disk under a hash of the request. Without
+    the renderer in that hash, editing the palette leaves every stored run
+    serving its old picture.
+    """
+    import hashlib
+    return hashlib.sha1(
+        f"{RENDER_VERSION}:{SIGNAL_BANDS!r}".encode()).hexdigest()[:12]
+
+
+# One S unit is 6 dB, on every band (IARU Region 1).
+S_UNIT_DB = 6.0
+
+
+def s_unit_dbm(s: float, s9_dbm: float) -> float:
+    """The level that reads S`s` against this band's S9 reference."""
+    return s9_dbm + (s - 9.0) * S_UNIT_DB
+
+
+def band_edges_dbm(s9_dbm: float) -> list[float]:
+    return [s9_dbm + off for off, _, _, _ in SIGNAL_BANDS]
+
+
+def legend(s9_dbm: float) -> list[dict]:
+    """The ramp as the UI draws it: one entry per band, in S units and dBm."""
+    return [{"label": label, "dbm": round(s9_dbm + off, 1),
+             "rgba": list(rgb) + [a]}
+            for off, label, rgb, a in SIGNAL_BANDS]
 
 
 def render_png(result: CoverageResult, size: int = 900,
@@ -204,16 +346,48 @@ def render_png(result: CoverageResult, size: int = 900,
     from PIL import Image
 
     req = result.request
-    floor = floor_dbm if floor_dbm is not None else req.sensitivity_dbm
+    s9 = req.s9_dbm
+    # Paint down to the bottom of the ramp, not to the receiver's threshold.
+    # Anchoring the floor to the mode made the map edge the sensitivity limit
+    # (S5 for FM on 2 m), which hides every weak-signal contact the operator
+    # can actually make on SSB or CW.
+    floor = floor_dbm if floor_dbm is not None else s9 + SIGNAL_BANDS[0][0]
     R = req.max_range_km * 1000.0
 
-    # square image spanning the bounding circle
-    ys, xs = np.mgrid[0:size, 0:size]
-    # image y grows downwards = north at the top
-    dx = (xs - (size - 1) / 2.0) / ((size - 1) / 2.0) * R
-    dy = ((size - 1) / 2.0 - ys) / ((size - 1) / 2.0) * R
-    rr = np.hypot(dx, dy)
-    aa = (np.degrees(np.arctan2(dx, dy))) % 360.0
+    # Draw in the projection the map will draw it in.
+    #
+    # Leaflet stretches an imageOverlay linearly between its corners in Web
+    # Mercator. This used to be painted as a flat metric square, which is an
+    # azimuthal-equidistant view, and the two do not agree: Mercator's
+    # latitude scale grows toward the pole, so equal degrees north and south
+    # of the station are not equal pixels and the whole picture slid toward
+    # the pole. Measured at 58 N that was 1.8 km north at a 120 km radius,
+    # 8 km at 250 km and 20.5 km at 400 km.
+    #
+    # So work backwards from where each pixel will actually land: take its
+    # latitude and longitude the way Leaflet will, then ask what range and
+    # bearing that is from the station.
+    south, north, west, east = _overlay_box(req)
+    y_top, y_bot = _merc_y(north), _merc_y(south)
+    lat_px = _inv_merc(np.linspace(y_top, y_bot, size))     # north at the top
+    lon_px = np.linspace(west, east, size)
+    lat_g = np.radians(lat_px)[:, None]
+    lon_g = np.radians(lon_px)[None, :]
+    lat_s, lon_s = math.radians(req.lat), math.radians(req.lon)
+
+    # Great circle from the station. The sweep itself walks out on the WGS-84
+    # ellipsoid; over these distances the difference between the two is far
+    # smaller than one grid cell, and a cell is 7 km wide at 400 km.
+    dlon_g = lon_g - lon_s
+    sin_dlat = np.sin((lat_g - lat_s) / 2.0)
+    sin_dlon = np.sin(dlon_g / 2.0)
+    hav = sin_dlat ** 2 + np.cos(lat_s) * np.cos(lat_g) * sin_dlon ** 2
+    rr = 2.0 * EARTH_R * np.arcsin(np.sqrt(np.clip(hav, 0.0, 1.0)))
+    rr = np.broadcast_to(rr, (size, size))
+    yb = np.sin(dlon_g) * np.cos(lat_g)
+    xb = (math.cos(lat_s) * np.sin(lat_g)
+          - math.sin(lat_s) * np.cos(lat_g) * np.cos(dlon_g))
+    aa = np.broadcast_to(np.degrees(np.arctan2(yb, xb)) % 360.0, (size, size))
 
     n_az, n_r = result.values.shape
     ai = aa / (360.0 / n_az)
@@ -236,20 +410,28 @@ def render_png(result: CoverageResult, size: int = 900,
         m = val > 0.5
         rgba[m] = (34, 197, 94, 150)
     else:
-        stops = SIGNAL_STOPS
+        # Band edges in the metric's own units. "margin" is dB above the
+        # receiver's threshold, so its bands sit on the same 6 dB spacing but
+        # start at 0 rather than at an absolute level.
         if req.metric == "margin":
-            stops = [(s[0] + 120 - 20, s[1]) for s in SIGNAL_STOPS]
-            floor = 0.0
+            base = SIGNAL_BANDS[0][0]
+            edges = [off - base for off, _, _, _ in SIGNAL_BANDS]
+            if floor_dbm is None:
+                floor = 0.0
+        else:
+            edges = band_edges_dbm(s9)
+        colours = np.array([list(rgb) + [a] for _, _, rgb, a in SIGNAL_BANDS],
+                           dtype=np.uint8)
+
         flat = val.ravel()
         out = np.zeros((flat.size, 4), dtype=np.uint8)
-        # vectorised ramp
-        finite = np.isfinite(flat) & (flat >= floor)
-        xs_ = np.array([s[0] for s in stops], dtype=float)
-        cs_ = np.array([s[1] for s in stops], dtype=float)
-        f = np.clip(flat[finite], xs_[0], xs_[-1])
-        idx = np.clip(np.searchsorted(xs_, f, side="right") - 1, 0, len(xs_) - 2)
-        t = ((f - xs_[idx]) / (xs_[idx + 1] - xs_[idx]))[:, None]
-        out[finite] = (cs_[idx] * (1 - t) + cs_[idx + 1] * t).astype(np.uint8)
+        shown = np.isfinite(flat) & (flat >= floor)
+        # Discrete bands, not a gradient: an edge in the picture is then always
+        # an S boundary that the legend names, never an arbitrary level.
+        idx = np.clip(np.searchsorted(np.array(edges, dtype=float),
+                                      flat[shown], side="right") - 1,
+                      0, len(edges) - 1)
+        out[shown] = colours[idx]
         rgba = out.reshape(size, size, 4)
 
     img = Image.fromarray(rgba, "RGBA")
@@ -258,13 +440,27 @@ def render_png(result: CoverageResult, size: int = 900,
     return buf.getvalue()
 
 
-def overlay_bounds(result: CoverageResult) -> list[list[float]]:
-    """Leaflet imageOverlay bounds for the square the PNG covers."""
-    req = result.request
+def _merc_y(lat):
+    """Web Mercator y for a latitude, in radians of Mercator units."""
+    return np.log(np.tan(np.pi / 4.0 + np.radians(lat) / 2.0))
+
+
+def _inv_merc(y):
+    return np.degrees(2.0 * np.arctan(np.exp(y)) - np.pi / 2.0)
+
+
+def _overlay_box(req) -> tuple[float, float, float, float]:
+    """south, north, west, east of the box the overlay occupies."""
     R = req.max_range_km * 1000.0
     dlat = math.degrees(R / EARTH_R)
     dlon = math.degrees(R / (EARTH_R * math.cos(math.radians(req.lat))))
-    return [[req.lat - dlat, req.lon - dlon], [req.lat + dlat, req.lon + dlon]]
+    return (req.lat - dlat, req.lat + dlat, req.lon - dlon, req.lon + dlon)
+
+
+def overlay_bounds(result: CoverageResult) -> list[list[float]]:
+    """Leaflet imageOverlay bounds for the box the PNG covers."""
+    south, north, west, east = _overlay_box(result.request)
+    return [[south, west], [north, east]]
 
 
 def contour_geojson(result: CoverageResult, levels: list[float]) -> dict:

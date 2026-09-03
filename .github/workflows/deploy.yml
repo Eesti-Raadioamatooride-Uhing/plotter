@@ -22,8 +22,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Deploy (Docker + Apache/ModSecurity WAF)
+        # Runs as the runner's own user, which only needs container access.
+        # The state directory is pinned outside the workspace because the
+        # checkout is wiped on every run and the elevation cache must survive.
         run: |
-          chmod +x deploy/deploy.sh
+          export PLOTTER_STATE_DIR="$HOME/plotter-state"
+          export PLOTTER_SERVERNAME=plotter.erau.ee
+          chmod +x deploy/deploy.sh deploy/user-timer.sh
           ./deploy/deploy.sh
 
       - name: Health check (through the WAF)

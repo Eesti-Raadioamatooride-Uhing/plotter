@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,9 +37,14 @@ log = logging.getLogger(__name__)
 try:  # rasterio is required for real data, but the module must import without it
     import rasterio
     HAVE_RASTERIO = True
-except Exception:  # pragma: no cover
+    RASTERIO_ERROR = ""
+except Exception as _exc:  # pragma: no cover
     rasterio = None
     HAVE_RASTERIO = False
+    # Keep the reason. Without rasterio every tile is unreadable, so terrain
+    # falls back to nodata and then to 0 m, which looks like a flat sea rather
+    # than like a failure. The startup check below turns that into a warning.
+    RASTERIO_ERROR = f"{type(_exc).__name__}: {_exc}"
 
 
 NODATA = -32768.0
@@ -63,6 +71,58 @@ class ElevationProvider:
 
 
 # --------------------------------------------------------------------------
+# Tile cache helpers, shared by the downloading providers
+# --------------------------------------------------------------------------
+
+class _TileLocks:
+    """One lock per tile key, created on demand.
+
+    The coverage sweep runs one solver per radial across a thread pool, so at
+    the start of a cold run every worker wants the same tile at the same
+    instant. Without this they all download it, and then all but one rename
+    a file that is no longer there. Holding a per-tile lock means one fetch
+    and the rest read the cache.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    def __call__(self, key: str) -> threading.Lock:
+        with self._guard:
+            return self._locks.setdefault(key, threading.Lock())
+
+
+# A cold 200 km sweep pulls about 30 Copernicus tiles, 15 to 25 MB each. The
+# sweep's thread pool would ask for up to `coverage_workers` of them at once,
+# which is where an open data endpoint starts refusing to talk to you. Cap the
+# simultaneous downloads instead: the tiles still arrive, just politely.
+_DOWNLOAD_SLOTS = threading.Semaphore(
+    max(1, int(os.environ.get("PLOTTER_TILE_DOWNLOAD_CONCURRENCY", "3"))))
+
+# WCS cells are a few hundred KB, not 20 MB, and a long high-resolution link
+# path crosses hundreds of them. Fetching those one at a time is what makes a
+# link analysis take minutes, so they get their own, larger allowance. Still
+# a limit: this is a public service, not an API.
+_WCS_SLOTS = threading.Semaphore(
+    max(1, int(os.environ.get("PLOTTER_WCS_FETCH_CONCURRENCY", "6"))))
+
+
+class TileFetchError(Exception):
+    """A tile could not be fetched this time. Says nothing about next time."""
+
+
+def _tmp_for(local: Path) -> Path:
+    """A scratch path unique to this process and thread.
+
+    A single shared ".part" name is not safe: a second writer truncates the
+    first writer's file, and whoever renames second gets ENOENT because the
+    name is already gone.
+    """
+    return local.with_suffix(f".{os.getpid()}.{threading.get_ident()}.part")
+
+
+# --------------------------------------------------------------------------
 # Copernicus GLO-30
 # --------------------------------------------------------------------------
 
@@ -86,8 +146,11 @@ class CopernicusDEM(ElevationProvider):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.bucket = bucket or self.BUCKETS[0]
         self.timeout_s = timeout_s
+        self.retries = 3
+        self.retry_backoff_s = 1.0
         self._open: dict[str, object] = {}
         self._lock = threading.Lock()
+        self._tile_locks = _TileLocks()
 
     @staticmethod
     def tile_name(lat: int, lon: int) -> str:
@@ -99,6 +162,33 @@ class CopernicusDEM(ElevationProvider):
     def covers(self, lat: float, lon: float) -> bool:
         return -60.0 <= lat <= 84.0
 
+    def is_cached(self, ilat: int, ilon: int) -> bool:
+        """True if this cell needs no network: either fetched, or known absent."""
+        name = self.tile_name(ilat, ilon)
+        return ((self.cache_dir / f"{name}.tif").exists()
+                or (self.cache_dir / f"{name}.missing").exists())
+
+    @staticmethod
+    def tiles_for_disc(lat: float, lon: float,
+                       radius_m: float) -> list[tuple[int, int]]:
+        """Every 1x1 degree cell a disc of this radius can reach.
+
+        Slightly generous at the corners, which is what you want: it is far
+        cheaper to pre-fetch one tile too many than to stall a coverage sweep
+        halfway through downloading 20 MB.
+        """
+        dlat = radius_m / 111320.0
+        coslat = max(math.cos(math.radians(lat)), 0.02)
+        dlon = radius_m / (111320.0 * coslat)
+        lat0 = int(math.floor(lat - dlat))
+        lat1 = int(math.floor(lat + dlat))
+        lon0 = int(math.floor(lon - dlon))
+        lon1 = int(math.floor(lon + dlon))
+        return [(a, b)
+                for a in range(lat0, lat1 + 1)
+                for b in range(lon0, lon1 + 1)
+                if -60 <= a <= 84]
+
     def _tile_path(self, ilat: int, ilon: int) -> Path | None:
         name = self.tile_name(ilat, ilon)
         local = self.cache_dir / f"{name}.tif"
@@ -108,31 +198,54 @@ class CopernicusDEM(ElevationProvider):
         if miss.exists():
             return None
         url = f"{self.bucket}/{name}/{name}.tif"
-        try:
-            import httpx
-            with httpx.stream("GET", url, timeout=self.timeout_s,
-                              follow_redirects=True) as r:
-                if r.status_code == 404:
-                    miss.touch()
-                    return None
-                r.raise_for_status()
-                tmp = local.with_suffix(".part")
-                with open(tmp, "wb") as fh:
-                    for chunk in r.iter_bytes(1 << 20):
-                        fh.write(chunk)
-                tmp.rename(local)
-            log.info("cached Copernicus tile %s", name)
-            return local
-        except Exception as exc:  # network down, blocked, whatever
-            log.warning("could not fetch %s: %s", url, exc)
-            return None
+        with self._tile_locks(name):
+            # Another thread may have fetched it while we waited.
+            if local.exists():
+                return local
+            if miss.exists():
+                return None
+            last = None
+            for attempt in range(self.retries):
+                if attempt:
+                    time.sleep(self.retry_backoff_s * (2 ** (attempt - 1)))
+                tmp = _tmp_for(local)
+                try:
+                    import httpx
+                    with _DOWNLOAD_SLOTS:
+                        with httpx.stream("GET", url, timeout=self.timeout_s,
+                                          follow_redirects=True) as r:
+                            if r.status_code == 404:
+                                # There is genuinely no tile here (ocean, or
+                                # off the product's grid). Remember that.
+                                miss.touch()
+                                return None
+                            r.raise_for_status()
+                            with open(tmp, "wb") as fh:
+                                for chunk in r.iter_bytes(1 << 20):
+                                    fh.write(chunk)
+                            os.replace(tmp, local)
+                    log.info("cached Copernicus tile %s", name)
+                    return local
+                except Exception as exc:  # throttled, reset, timed out
+                    tmp.unlink(missing_ok=True)
+                    last = exc
+            log.warning("could not fetch %s after %d attempts: %s",
+                        url, self.retries, last)
+            raise TileFetchError(str(last))
 
     def _dataset(self, ilat: int, ilon: int):
         key = f"{ilat}_{ilon}"
         with self._lock:
             if key in self._open:
                 return self._open[key]
-        path = self._tile_path(ilat, ilon)
+        try:
+            path = self._tile_path(ilat, ilon)
+        except TileFetchError:
+            # A transient failure, so do NOT remember it. Caching the miss
+            # would leave this whole 1 degree cell reading as 0 m for the life
+            # of the process, and a flat hole in the terrain looks like a
+            # valley rather than like a network problem.
+            return None
         ds = None
         if path is not None and HAVE_RASTERIO:
             try:
@@ -204,6 +317,7 @@ class WCSProvider(ElevationProvider):
             self.cell_deg = cell_deg
         self._open: dict[str, object] = {}
         self._lock = threading.Lock()
+        self._tile_locks = _TileLocks()
         self.enabled = bool(url)
 
     def covers(self, lat: float, lon: float) -> bool:
@@ -260,29 +374,41 @@ class WCSProvider(ElevationProvider):
             "SUBSET": subset,
         }
         params.update(self.extra)
-        try:
-            import httpx
-            r = httpx.get(self.url, params=params, timeout=self.timeout_s,
-                          follow_redirects=True)
-            if r.status_code >= 400 or not r.content[:2] in (b"II", b"MM"):
-                miss.touch()
-                log.info("%s: no coverage for cell %s (%s)", self.name, key,
-                         r.status_code)
+        tmp = _tmp_for(local)
+        with self._tile_locks(key):
+            # Another thread may have fetched this cell while we waited.
+            if local.exists():
+                return local
+            if miss.exists():
                 return None
-            tmp = local.with_suffix(".part")
-            tmp.write_bytes(r.content)
-            tmp.rename(local)
-            return local
-        except Exception as exc:
-            log.warning("%s fetch failed for %s: %s", self.name, key, exc)
-            return None
+            try:
+                import httpx
+                with _WCS_SLOTS:
+                    r = httpx.get(self.url, params=params,
+                                  timeout=self.timeout_s,
+                                  follow_redirects=True)
+                if r.status_code >= 400 or not r.content[:2] in (b"II", b"MM"):
+                    miss.touch()
+                    log.info("%s: no coverage for cell %s (%s)", self.name,
+                             key, r.status_code)
+                    return None
+                tmp.write_bytes(r.content)
+                os.replace(tmp, local)
+                return local
+            except Exception as exc:
+                tmp.unlink(missing_ok=True)
+                log.warning("%s fetch failed for %s: %s", self.name, key, exc)
+                raise TileFetchError(str(exc)) from exc
 
     def _dataset(self, cy: int, cx: int):
         key = f"{cy}_{cx}"
         with self._lock:
             if key in self._open:
                 return self._open[key]
-        path = self._fetch(cy, cx)
+        try:
+            path = self._fetch(cy, cx)
+        except TileFetchError:
+            return None          # transient, see CopernicusDEM._dataset
         ds = None
         if path is not None and HAVE_RASTERIO:
             try:
@@ -293,13 +419,31 @@ class WCSProvider(ElevationProvider):
             self._open[key] = ds
         return ds
 
+    def _warm_cells(self, cells: list[tuple[int, int]]) -> None:
+        """Resolve every cell we are about to need, concurrently.
+
+        A 220 km path at 1 m resolution crosses hundreds of cells. Asking for
+        them one at a time, at about 0.8 s each, is minutes of waiting before
+        any propagation is computed. They are independent HTTP fetches, so
+        overlap them and let the fetch semaphore keep it polite.
+        """
+        todo = [c for c in cells if f"{c[0]}_{c[1]}" not in self._open]
+        if len(todo) < 2:
+            return
+        workers = min(8, len(todo))
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="wcs") as ex:
+            list(ex.map(lambda c: self._dataset(*c), todo))
+
     def sample(self, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
         lats = np.asarray(lats, dtype=float)
         lons = np.asarray(lons, dtype=float)
         out = np.full(lats.shape, np.nan)
         cys = np.floor(lats / self.cell_deg).astype(int)
         cxs = np.floor(lons / self.cell_deg).astype(int)
-        for cy, cx in {(int(a), int(b)) for a, b in zip(cys, cxs)}:
+        cells = sorted({(int(a), int(b)) for a, b in zip(cys, cxs)})
+        self._warm_cells(cells)
+        for cy, cx in cells:
             m = (cys == cy) & (cxs == cx)
             ds = self._dataset(cy, cx)
             if ds is None:
@@ -457,6 +601,15 @@ def _bilinear(ds, lats: np.ndarray, lons: np.ndarray,
 
 
 # --------------------------------------------------------------------------
+
+def terrain_factory(settings):
+    """A picklable way to rebuild Terrain inside a worker process.
+
+    A module-level function, because the coverage sweep hands this to a
+    process pool and a closure or a bound method would not pickle.
+    """
+    return Terrain.from_settings(settings)
+
 
 class Terrain:
     """Facade over the configured providers with a coarse-to-fine preference."""

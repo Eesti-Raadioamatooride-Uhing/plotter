@@ -7,6 +7,12 @@ const API = (p) => (window.PLOTTER_BASE || '') + '/api' + p;
 
 let META = null;
 let map, layerCtl;
+// The polar value grid of the last coverage run, kept so the map readout can
+// answer a mouse move without a round trip.
+let coverageGrid = null;
+let aiming = false;          // clicking the map aims the beam
+let beamLine = null;         // where the beam points, drawn from the station
+const GRID_UNIT = { signal: 'dBm', loss: 'dB loss', margin: 'dB margin', los: '' };
 const markers = {};
 let coverageOverlay = null, horizonLayer = null, linkLine = null,
     hfRings = null, mastLayer = null, txLayer = null;
@@ -129,7 +135,7 @@ function writeSite(key, lat, lon) {
   $(f[0]).value = lat.toFixed(5);
   $(f[1]).value = lon.toFixed(5);
   setMarker(key, lat, lon);
-  if (key === 'cov') lookupElevation(lat, lon);
+  if (key === 'cov') { lookupElevation(lat, lon); warmForCoverage(); drawBeam(); }
   if (key === 'a' || key === 'b') drawLinkLine();
 }
 
@@ -148,6 +154,83 @@ function drawLinkLine() {
     .addTo(map);
 }
 
+/* ------------------------------------------------------- map readout */
+// Distance and bearing from the station to the cursor, plus the coverage
+// value there. Great-circle on a sphere is plenty for a hover hint: it is
+// within a few metres of the Vincenty answer the backend uses.
+const R_EARTH_M = 6371008.8;
+const rad = d => d * Math.PI / 180, deg = r => r * 180 / Math.PI;
+
+function bearingDistance(lat1, lon1, lat2, lon2) {
+  const p1 = rad(lat1), p2 = rad(lat2), dl = rad(lon2 - lon1);
+  const dp = p2 - p1;
+  const a = Math.sin(dp / 2) ** 2 +
+            Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+  const dist = 2 * R_EARTH_M * Math.asin(Math.min(1, Math.sqrt(a)));
+  const y = Math.sin(dl) * Math.cos(p2);
+  const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+  return { distance_m: dist, bearing_deg: (deg(Math.atan2(y, x)) + 360) % 360 };
+}
+
+// S-meter reading, IARU Region 1: one S unit is 6 dB, and S9 is -73 dBm on HF
+// but -93 dBm above 30 MHz. The server sends which reference applies, so the
+// readout shows what a correctly calibrated rig on that band would show.
+function sMeter(dbm, s9) {
+  if (!isFinite(s9)) return null;
+  const over = dbm - s9;
+  if (over >= 0) return over >= 1 ? `S9+${Math.round(over)} dB` : 'S9';
+  const s = 9 + over / 6;
+  return s < 0.5 ? 'below S1' : `S${Math.round(Math.max(1, s))}`;
+}
+
+// Same bilinear read of the polar grid that render_png does server side, so
+// the number under the cursor is the number under the pixel.
+function gridValueAt(g, bearingDeg, distanceM) {
+  const ai = ((bearingDeg % 360) + 360) % 360 / g.azimuth_step_deg;
+  const ri = g.range_step_m > 0 ? distanceM / g.range_step_m : 0;
+  if (ri > g.n_r - 1) return null;
+  const a0 = Math.floor(ai) % g.n_az, a1 = (a0 + 1) % g.n_az, fa = ai - Math.floor(ai);
+  const r0 = Math.min(Math.max(Math.floor(ri), 0), g.n_r - 1);
+  const r1 = Math.min(r0 + 1, g.n_r - 1), fr = Math.min(Math.max(ri - Math.floor(ri), 0), 1);
+  const v = [g.values[a0][r0], g.values[a1][r0], g.values[a0][r1], g.values[a1][r1]];
+  if (v.some(x => x === null || x === undefined)) return null;
+  return (v[0] * (1 - fa) + v[1] * fa) * (1 - fr) + (v[2] * (1 - fa) + v[3] * fa) * fr;
+}
+
+function updateReadout(e) {
+  const box = $('readout');
+  if (!coverageGrid) { box.classList.add('hidden'); return; }
+  const c = coverageGrid;
+  const bd = bearingDistance(c.lat, c.lon, e.latlng.lat, e.latlng.lng);
+  const parts = [`${(bd.distance_m / 1000).toFixed(1)} km`,
+                 `${bd.bearing_deg.toFixed(0)}\u00b0`];
+  if (bd.distance_m <= c.maxRangeM) {
+    const v = gridValueAt(c.grid, bd.bearing_deg, bd.distance_m);
+    if (v === null) {
+      parts.push('no data');
+    } else if (c.grid.metric === 'los') {
+      parts.push(v >= 0.5 ? 'line of sight' : 'obstructed');
+    } else {
+      parts.push(`${v.toFixed(1)} ${c.unit}`);
+      if (c.grid.metric === 'signal') {
+        const s = sMeter(v, c.s9);
+        if (s) parts.push(s);
+        // The S reading alone does not say whether the mode can copy it:
+        // -119 dBm FM is still S5 on 2 m, and that is the threshold.
+        if (v < c.sensitivity) {
+          const m = c.modeLabel.replace(/\s*\(.*\)$/, '');   // "FM (12 kHz)" -> "FM"
+          parts.push(c.sensitivityS ? `under ${m}, needs ${c.sensitivityS}`
+                                    : `under ${m}`);
+        }
+      }
+    }
+  } else {
+    parts.push('outside the sweep');
+  }
+  box.textContent = parts.join('  \u00b7  ');
+  box.classList.remove('hidden');
+}
+
 /* ------------------------------------------------------------ init form */
 function fillSelect(el, entries, selected) {
   el.innerHTML = entries.map(([v, l]) =>
@@ -158,6 +241,36 @@ function antennaOptions(groups) {
   return Object.entries(META.antennas)
     .filter(([, v]) => groups.includes(v.group) || v.group === 'any')
     .map(([k, v]) => [k, v.label]);
+}
+
+// What the "Gain / size" box means for a preset, and what the preset's own
+// value is. Dishes take a diameter in metres, wires a height in metres,
+// everything else a peak gain in dBi.
+function antennaFieldValue(preset) {
+  const def = META.antennas[preset];
+  if (!def) return null;
+  const p = def.params || {};
+  if (def.type === 'dish') return p.diameter_m ?? null;
+  // Wires take their height from the mast height field, so the box is unused.
+  if (def.type === 'wire') return null;
+  if (def.type === 'isotropic') return p.gain_dbi ?? 0;
+  return p.peak_gain_dbi ?? null;
+}
+
+// Keep that box in step with the selected antenna. Without this it kept
+// whatever number was there before, and antennaSpec() sent it as an override,
+// so every beam quietly ran at the last antenna's gain: pick a 7 element yagi
+// and it still radiated the collinear's 6 dBi.
+function bindAntennaGain(prefix) {
+  const sel = $(prefix + '-ant');
+  const box = $(prefix + '-gain');
+  if (!sel || !box) return;
+  const sync = () => {
+    const v = antennaFieldValue(sel.value);
+    if (v !== null) box.value = v;
+  };
+  sel.addEventListener('change', sync);
+  sync();
 }
 
 async function loadMeta() {
@@ -180,13 +293,15 @@ async function loadMeta() {
   ['cov-ground', 'lnk-ground', 'hf-ground'].forEach(id =>
     fillSelect($(id), grounds, 'average'));
 
-  fillSelect($('cov-climate'),
-    Object.entries(META.climates).map(([k, v]) => [k, v]), '6');
+  const climates = Object.entries(META.climates).map(([k, v]) => [k, v]);
+  fillSelect($('cov-climate'), climates, '6');
+  fillSelect($('lnk-climate'), climates, '6');
 
   fillSelect($('cov-ant'), antennaOptions(['vhf', 'uhf', 'shf']), 'collinear_6');
   fillSelect($('a-ant'), antennaOptions(['vhf', 'uhf', 'shf', 'hf']), 'dish_600');
   fillSelect($('b-ant'), antennaOptions(['vhf', 'uhf', 'shf', 'hf']), 'dish_600');
   fillSelect($('hf-ant'), antennaOptions(['hf']), 'dipole');
+  ['cov', 'a', 'b'].forEach(bindAntennaGain);
 
   const bandFreq = {};
   META.bands.forEach(b => bandFreq[b.key] = b.centre_mhz);
@@ -199,6 +314,63 @@ async function loadMeta() {
   const now = new Date();
   $('hf-when').value = new Date(now.getTime() - now.getTimezoneOffset() * 0)
     .toISOString().slice(0, 16);
+}
+
+// Draw where the beam points. A directional antenna that is silently aimed at
+// true north looks like a terrain artefact rather than a setting, so show it.
+function drawBeam() {
+  if (beamLine) { map.removeLayer(beamLine); beamLine = null; }
+  const def = META.antennas[$('cov-ant').value];
+  if (!def || def.type === 'omni' || def.type === 'isotropic') return;
+  const lat = num('cov-lat'), lon = num('cov-lon');
+  if (!isFinite(lat) || !isFinite(lon)) return;
+  const bear = num('cov-bear', 0);
+  const R = 6371008.8, rad = d => d * Math.PI / 180, deg = r => r * 180 / Math.PI;
+  const reach = Math.max(num('cov-range', 60), 5) * 1000;
+  const p1 = rad(lat), l1 = rad(lon), b = rad(bear), dr = reach / R;
+  const p2 = Math.asin(Math.sin(p1) * Math.cos(dr) + Math.cos(p1) * Math.sin(dr) * Math.cos(b));
+  const l2 = l1 + Math.atan2(Math.sin(b) * Math.sin(dr) * Math.cos(p1),
+                             Math.cos(dr) - Math.sin(p1) * Math.sin(p2));
+  beamLine = L.polyline([[lat, lon], [deg(p2), deg(l2)]], {
+    color: '#ffb454', weight: 2, opacity: 0.9, dashArray: '7 6',
+  }).addTo(map).bindTooltip(`beam ${Math.round(bear)}\u00b0 true`);
+}
+
+/* --------------------------------------------------- terrain prefetch */
+// Picking a station kicks off the elevation download for the area a sweep
+// would need. Without this the first coverage run pays for it inline: a cold
+// 250 km sweep spent ~50 s downloading before it computed anything, and a
+// proxy in front of the app would cut the connection long before it finished.
+let warmToken = 0;
+
+async function warmTerrain(lat, lon, radiusKm) {
+  const token = ++warmToken;                 // a newer pick cancels this one
+  const box = $('warm-status');
+  try {
+    for (let i = 0; i < 200; i++) {
+      const r = await post('/terrain/warm',
+        { lat, lon, radius_km: radiusKm, max_tiles: 4 });
+      if (token !== warmToken) return;       // superseded, stop quietly
+      if (!r.total) { box.classList.add('hidden'); return; }
+      const done = r.total - r.remaining;
+      if (r.remaining <= 0) {
+        box.textContent = `Terrain ready (${r.total} tiles)`;
+        setTimeout(() => { if (token === warmToken) box.classList.add('hidden'); }, 2500);
+        return;
+      }
+      box.textContent = `Fetching terrain ${done}/${r.total} tiles`;
+      box.classList.remove('hidden');
+    }
+  } catch (e) {
+    // Not fatal: the coverage run will fetch whatever is still missing.
+    if (token === warmToken) box.classList.add('hidden');
+  }
+}
+
+function warmForCoverage() {
+  const lat = num('cov-lat'), lon = num('cov-lon');
+  if (!isFinite(lat) || !isFinite(lon)) return;
+  warmTerrain(lat, lon, num('cov-range', 60));
 }
 
 /* ------------------------------------------------------------- coverage */
@@ -214,8 +386,12 @@ function antennaSpec(prefix, kind) {
     spec.height_m = num(prefix + '-h', 12);
     if ($(prefix + '-orient')) spec.orientation_deg = num(prefix + '-orient', 90);
   } else if ($(prefix + '-gain')) {
-    spec.peak_gain_dbi = num(prefix + '-gain');
-    spec.gain_dbi = num(prefix + '-gain');
+    // An override, not a default. Left empty, the preset's own gain stands.
+    const g = num(prefix + '-gain');
+    if (g !== undefined) {
+      spec.peak_gain_dbi = g;
+      spec.gain_dbi = g;
+    }
   }
   return spec;
 }
@@ -225,6 +401,23 @@ const DETAIL = {
   normal: { azimuth_step_deg: 2, range_step_m: 500 },
   fine:   { azimuth_step_deg: 1, range_step_m: 250 },
 };
+
+// Drives the /<kind>/start and /<kind>/job/{id} pair. Each request is short,
+// so no proxy or CDN timeout applies to the work itself. Both the sweep and
+// the path analysis run for minutes on a cold cache, and both used to die on
+// whatever gave up first.
+async function runJob(kind, body, btn, verb) {
+  const job = await post(kind + '/start', body);
+  if (job.result) return job.result;
+  for (let i = 0; i < 3600; i++) {
+    const st = await api(`${kind}/job/${job.id}`);
+    if (st.state === 'done') { btn.textContent = verb + '\u2026'; return st.result; }
+    const pct = st.progress ? ` ${Math.round(st.progress * 100)}%` : '\u2026';
+    btn.textContent = verb + pct;
+    await new Promise(r => setTimeout(r, i < 10 ? 300 : 1000));
+  }
+  throw new Error('the run did not finish');
+}
 
 async function runCoverage() {
   const btn = $('cov-run');
@@ -249,19 +442,37 @@ async function runCoverage() {
       azimuth_step_deg: d.azimuth_step_deg, range_step_m: d.range_step_m,
     };
     const t0 = performance.now();
-    const r = await post('/coverage', body);
+    // Start it in the background and poll. A fine-detail long-range sweep is
+    // minutes of ITM solving, and holding one connection open for that is
+    // what produced the bare "NetworkError" through the proxy.
+    const r = await runJob('/coverage', body, btn, 'Computing');
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
 
     if (coverageOverlay) map.removeLayer(coverageOverlay);
     coverageOverlay = L.imageOverlay(r.image_url, r.bounds, { opacity: 0.75 })
       .addTo(map);
+    coverageGrid = r.grid ? {
+      grid: r.grid, lat: body.site.lat, lon: body.site.lon,
+      maxRangeM: body.max_range_km * 1000,
+      sensitivity: r.sensitivity_dbm, unit: GRID_UNIT[r.grid.metric] || 'dBm',
+      s9: r.s9_dbm,
+      // Name the threshold that is being failed. "S3, below sensitivity" only
+      // prompts the question "below what?": S3 is a perfectly good signal on
+      // CW and hopeless on FM, and the difference is this setting.
+      modeLabel: (META.modes[$('cov-mode').value] || {}).label || 'the receiver',
+      sensitivityS: r.sensitivity_s_meter || '',
+    } : null;
     map.fitBounds(r.bounds, { padding: [30, 30] });
 
-    const legend = '<div class="legend">' + r.legend.map(s =>
-      `<div style="background:rgba(${s.rgba.join(',')})"></div>`).join('') +
-      '</div><div class="legend-labels"><span>' +
-      r.legend[0].dbm + ' dBm</span><span>' +
-      r.legend[r.legend.length - 1].dbm + ' dBm</span></div>';
+    // One swatch per S band, each labelled with the S units it covers. The
+    // exact level is the cursor readout's job, so the legend stays readable.
+    const legend = '<div class="legend">' + r.legend.map(b =>
+      `<div style="background:rgba(${b.rgba.join(',')})" title="${b.dbm} dBm and up"></div>`
+      ).join('') + '</div><div class="legend-labels">' +
+      r.legend.map(b => `<span>${b.label}</span>`).join('') + '</div>' +
+      `<div class="sub">S9 = ${r.s9_dbm} dBm on this band` +
+      (r.sensitivity_s_meter
+        ? ` · receiver copies down to ${r.sensitivity_s_meter}` : '') + '</div>';
 
     $('cov-result').innerHTML =
       sect('Result') +
@@ -273,7 +484,8 @@ async function runCoverage() {
         ['Threshold', fmt(r.sensitivity_dbm, 0) + ' dBm'],
         ['Paths evaluated', r.stats.itm_calls.toLocaleString()],
         ['Compute time', secs + ' s'],
-      ]) + legend;
+      ]) + legend +
+      (r.notes || []).map(n => `<div class="hint">${n}</div>`).join('');
   } catch (e) {
     toast(e.message, true);
   } finally {
@@ -320,12 +532,16 @@ async function runLink() {
       k_factor: num('lnk-k', 1.333), clutter_m: num('lnk-clutter', 0),
       use_buildings: $('lnk-buildings').checked,
       availability_pct: parseFloat($('lnk-avail').value),
+      // ITM time availability. Over-horizon paths swing tens of dB across
+      // this, so it is the difference between an average day and a lift.
+      reliability: parseFloat($('lnk-rel').value),
+      climate: parseInt($('lnk-climate').value),
       high_res_terrain: $('lnk-hires').checked,
     };
     // make sure both ends are on the map, so A/B are visible after a run
     writeSite('a', body.tx.lat, body.tx.lon);
     writeSite('b', body.rx.lat, body.rx.lon);
-    const r = await post('/link', body);
+    const r = await runJob('/link', body, btn, 'Analysing');
     lastProfile = r; lastTerrain = null;
     renderLink(r);
     drawProfile(r);
@@ -385,7 +601,8 @@ function renderLink(r) {
     ['A antenna gain', fmt(r.tx_gain_dbi, 1) + ' dBi'],
     ['EIRP', fmt(r.eirp_dbm, 1) + ' dBm'],
     ['B antenna gain', fmt(r.rx_gain_dbi, 1) + ' dBi'],
-    ['<b>Received level</b>', '<b>' + fmt(r.rx_level_dbm, 1) + ' dBm</b>'],
+    ['<b>Received level</b>', '<b>' + fmt(r.rx_level_dbm, 1) + ' dBm</b>' +
+      (r.s_meter ? ' <span class="dim">' + r.s_meter + '</span>' : '')],
     ['Thermal noise floor', fmt(r.noise_floor_dbm, 1) + ' dBm'],
     ['SNR', fmt(r.snr_db, 1) + ' dB'],
     ['Sensitivity', fmt(r.sensitivity_dbm, 1) + ' dBm'],
@@ -397,7 +614,9 @@ function renderLink(r) {
     html += sect('Budget B → A');
     html += kv([
       ['EIRP', fmt(r.reverse.eirp_dbm, 1) + ' dBm'],
-      ['Received level', fmt(r.reverse.rx_level_dbm, 1) + ' dBm'],
+      ['Received level', fmt(r.reverse.rx_level_dbm, 1) + ' dBm' +
+        (r.s9_dbm !== undefined
+          ? ' ' + (sMeter(r.reverse.rx_level_dbm, r.s9_dbm) || '') : '')],
       ['Margin', fmt(r.reverse.link_margin_db, 1) + ' dB · ' + r.reverse.verdict],
     ]);
   }
@@ -911,6 +1130,18 @@ function initMap() {
   });
 
   map.on('click', (e) => {
+    if (aiming) {
+      // Aim the beam at whatever was clicked, so "which way does it point"
+      // is a thing you do on the map rather than a number you guess.
+      const bd = bearingDistance(num('cov-lat'), num('cov-lon'),
+                                 e.latlng.lat, e.latlng.lng);
+      $('cov-bear').value = Math.round(bd.bearing_deg);
+      $('cov-bear-pick').classList.remove('armed');
+      aiming = false;
+      drawBeam();
+      toast(`Beam aimed at ${Math.round(bd.bearing_deg)}\u00b0 true`);
+      return;
+    }
     if (!picking) return;
     writeSite(picking, e.latlng.lat, e.latlng.lng);
     document.querySelectorAll('button.pick').forEach(b => b.classList.remove('armed'));
@@ -951,6 +1182,7 @@ function setMode(mode) {
     if (markers[k]) toggle(markers[k], (MODE_MARKERS[mode] || []).includes(k));
   });
   toggle(coverageOverlay, mode === 'coverage');
+  toggle(beamLine, mode === 'coverage');
   toggle(horizonLayer, mode === 'coverage');
   toggle(linkLine, mode === 'link');
   toggle(hfRings, mode === 'hf');
@@ -978,9 +1210,19 @@ function bindUI() {
     });
   });
 
+  $('cov-bear-pick').addEventListener('click', () => {
+    aiming = !aiming;
+    $('cov-bear-pick').classList.toggle('armed', aiming);
+    if (aiming) toast('Click the map to aim the beam');
+  });
+  $('cov-bear').addEventListener('change', drawBeam);
+  $('cov-ant').addEventListener('change', drawBeam);
+
   document.querySelectorAll('button.pick').forEach(b => {
     b.addEventListener('click', () => {
       document.querySelectorAll('button.pick').forEach(x => x.classList.remove('armed'));
+      aiming = false;
+      $('cov-bear-pick').classList.remove('armed');
       picking = b.dataset.target;
       b.classList.add('armed');
       toast('Click the map to place ' + picking.toUpperCase());
@@ -992,6 +1234,8 @@ function bindUI() {
       const k = id[0];
       writeSite(k, num(k + '-lat'), num(k + '-lon'));
     }));
+  ['cov-range'].forEach(id => $(id).addEventListener('change',
+    () => { warmForCoverage(); drawBeam(); }));
   ['cov-lat', 'cov-lon'].forEach(id => $(id).addEventListener('change',
     () => writeSite('cov', num('cov-lat'), num('cov-lon'))));
   ['hf-lat', 'hf-lon'].forEach(id => $(id).addEventListener('change',
@@ -1042,6 +1286,8 @@ function bindUI() {
     e.target.disabled = false; e.target.textContent = 'Harvest JVIS register';
   });
 
+  map.on('mousemove', updateReadout);
+  map.on('mouseout', () => $('readout').classList.add('hidden'));
   window.addEventListener('resize', () => {
     if ($('profile').classList.contains('hidden')) return;
     if (lastTerrain) drawTerrainProfile(lastTerrain);
