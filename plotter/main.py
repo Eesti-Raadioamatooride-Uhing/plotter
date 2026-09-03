@@ -1,13 +1,15 @@
 """Plotter application entry point."""
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import jobs
@@ -100,16 +102,60 @@ async def _harden(request, call_next):
     response = await call_next(request)
     for k, v in _SECURITY_HEADERS.items():
         response.headers.setdefault(k, v)
+    if request.url.path.startswith("/static/"):
+        # A stamped URL names one exact build of the file, so it can be cached
+        # hard. An unstamped one has to be revalidated, or the browser is free
+        # to invent its own expiry and serve last week's JavaScript.
+        response.headers.setdefault(
+            "Cache-Control",
+            "public, max-age=31536000, immutable"
+            if request.query_params.get("v") else "no-cache")
     return response
 
 
 app.include_router(router, prefix="/api")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
+# index.html references its own CSS and JS as "/static/app.js?v=3". A hand
+# written version like that has to be remembered on every edit, and when it is
+# not, browsers keep serving the previous file: nothing has no-store on it and
+# StaticFiles sends no Cache-Control, so a browser is free to reuse a cached
+# copy without revalidating. The visible result is a page whose HTML is new and
+# whose JS is old, where only the newest controls are dead. So stamp the query
+# with a hash of the file that is actually on disk, and never cache the HTML
+# that carries those stamps.
+_ASSET_RE = re.compile(r'(?P<attr>(?:src|href)=")/static/(?P<file>[\w.-]+)\?v=[^"]*"')
+_ASSET_VERSIONS: dict[str, tuple[tuple[int, int], str]] = {}
+
+
+def _asset_version(name: str) -> str:
+    if name.startswith(".") or "/" in name:
+        return "0"
+    path = STATIC / name
+    try:
+        stat = path.stat()
+    except OSError:
+        return "0"
+    key = (stat.st_mtime_ns, stat.st_size)
+    cached = _ASSET_VERSIONS.get(name)
+    if cached and cached[0] == key:
+        return cached[1]
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+    _ASSET_VERSIONS[name] = (key, digest)
+    return digest
+
+
+def _render_index() -> str:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    return _ASSET_RE.sub(
+        lambda m: f'{m["attr"]}/static/{m["file"]}?v={_asset_version(m["file"])}"',
+        html)
+
 
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(STATIC / "index.html")
+    return HTMLResponse(_render_index(),
+                        headers={"Cache-Control": "no-cache"})
 
 
 def main() -> None:

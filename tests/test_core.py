@@ -983,3 +983,47 @@ def test_link_and_coverage_share_the_run_store():
     assert lk != cv
     assert lk.isalnum() and len(lk) <= 64
     assert cv.isalnum() and len(cv) <= 64
+
+
+def test_index_stamps_assets_with_their_content_hash():
+    """A changed app.js must change its URL, or browsers keep the old one.
+
+    The hand written "?v=3" was not bumped when app.js changed, so a returning
+    browser paired the new HTML with the JavaScript it already had. Only the
+    newest controls were dead, which reads like a broken feature rather than a
+    cache, so the stamp now comes from the file itself.
+    """
+    import re
+
+    from plotter import main as m
+
+    html = m._render_index()
+    stamps = dict(re.findall(r'/static/([\w.-]+)\?v=(\w+)', html))
+    assert {"app.js", "style.css"} <= set(stamps)
+    assert stamps["app.js"] == m._asset_version("app.js")
+    assert stamps["app.js"] != stamps["style.css"]
+    # No hand written version survives: every stamp is a full length digest.
+    assert all(len(v) == 12 for v in stamps.values())
+
+    # The stamp has to follow the file, including when only its bytes change.
+    app_js = m.STATIC / "app.js"
+    original = app_js.read_bytes()
+    try:
+        app_js.write_bytes(original + b"\n// touched\n")
+        assert m._asset_version("app.js") != stamps["app.js"]
+    finally:
+        app_js.write_bytes(original)
+    assert m._asset_version("app.js") == stamps["app.js"]
+
+
+def test_static_cache_headers_depend_on_the_stamp():
+    """Stamped URLs are immutable, unstamped ones must be revalidated."""
+    from fastapi.testclient import TestClient
+
+    from plotter.main import app
+
+    with TestClient(app) as c:
+        assert c.get("/").headers["cache-control"] == "no-cache"
+        stamped = c.get("/static/app.js?v=deadbeef").headers["cache-control"]
+        assert "immutable" in stamped
+        assert c.get("/static/app.js").headers["cache-control"] == "no-cache"
